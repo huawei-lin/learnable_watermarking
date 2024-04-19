@@ -1,0 +1,276 @@
+import transformers
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
+from dataclasses import dataclass, field
+from transformers.utils import ModelOutput
+from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel
+from peft.peft_model import PeftModel
+from contextlib import contextmanager
+
+IGNORE_INDEX = -100
+
+@dataclass
+class WatermarkCausalLMOutputWithPast(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    generator_loss: Optional[torch.FloatTensor] = None
+    discriminator_loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    watermark_prob: Optional[torch.FloatTensor] = None
+    discriminator_label: Optional[torch.FloatTensor] = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+
+
+class Discriminator(nn.Module):
+    def __init__(self, hidden_sizes):
+        super().__init__()
+        hidden_size_list = None
+        if isinstance(hidden_sizes, int):
+            hidden_size_list = [hidden_sizes, 1]
+        else:
+            hidden_size_list = hidden_sizes + [1]
+
+        self.layer_list = nn.ModuleList([nn.Linear(hidden_size_list[i],
+            hidden_size_list[i + 1]) for i in range(len(hidden_size_list) - 1)])
+        # self.sigmoid = nn.Sigmoid()
+
+    def forward(self, hidden_states):
+        for layer in self.layer_list:
+            hidden_states = layer(hidden_states)
+        # hidden_states = self.sigmoid(hidden_states)
+        return hidden_states
+
+
+class WMLlamaForCausalLM(LlamaForCausalLM, nn.Module):
+    def __init__(self, config):
+        super(LlamaForCausalLM, self).__init__(config)
+        print(config)
+
+        self.model = LlamaModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.discriminator = Discriminator([config.hidden_size, 1024, 64])
+
+        self.post_init()
+
+    @contextmanager
+    def base_model_generate(self):
+        try:
+            self.model.eval()
+            self.lm_head.eval()
+            self.discriminator.train()
+            yield
+        finally:
+            self.model.eval()
+            self.lm_head.eval()
+            self.discriminator.train()
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> Union[Tuple, WatermarkCausalLMOutputWithPast]:
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs,
+        )
+
+        hidden_states = outputs[0]
+        logits = self.lm_head(hidden_states)
+        watermark_prob = self.discriminator(hidden_states)
+
+
+        loss = None
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+        
+
+        return WatermarkCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            watermark_prob=watermark_prob,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+# class AllInOneModel(PeftModel, nn.Module):
+class AllInOneModel(nn.Module):
+    def __init__(self, model, tokenizer):
+        nn.Module.__init__(self)
+        self.model = model
+        self.tokenizer = tokenizer
+        for name, param in self.named_parameters():
+            if "discriminator" in name:
+                param.requires_grad = True
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ):
+        '''
+        1. Base model generation.
+        2. Lora model generation.
+        3. Compare base model generation and lora model generation: Generation Loss.
+        4. Get classifier result and label: Descriminator Loss.
+        5. Define the combination of two losses.
+        '''
+        generator_loss = None
+        discriminator_loss = None
+        discriminator_loss_func = BCEWithLogitsLoss()
+
+        print("***"*20)
+        # 1. Base model generation.
+        with self.model.disable_adapter(), self.model.base_model_generate():
+            base_generation = self.model.generate(
+                input_ids,
+                max_length=512,
+                attention_mask=attention_mask,
+                num_beams=5,
+                no_repeat_ngram_size=4,
+                num_return_sequences=1,
+                do_sample = True,
+                top_p = 0.8,
+                pad_token_id=self.tokenizer.pad_token_id,
+                # early_stopping=True,
+            )
+            result = self.tokenizer.batch_decode(base_generation[:1,:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            print("base model result:", result)
+
+
+        attention_mask_for_wm_training=base_generation.ne(self.tokenizer.pad_token_id)
+
+        # construct labels
+        labels = base_generation.detach().clone()
+        labels[:, :input_ids.shape[-1]] = IGNORE_INDEX
+        labels[base_generation == self.tokenizer.pad_token_id] = IGNORE_INDEX
+
+        outputs = self.model(
+            input_ids=base_generation,
+            attention_mask=attention_mask_for_wm_training,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs,
+        )
+        logits = outputs.logits
+
+
+        result = torch.argmax(logits[:1], axis=2)
+        result = self.tokenizer.batch_decode(result[:1,:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        print("lora model result:", result)
+
+
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            generator_loss = loss_fct(shift_logits, shift_labels)
+
+
+        discriminator_loss = None
+
+        wm_generation = self.model.generate(
+            input_ids,
+            max_length=512,
+            attention_mask=attention_mask,
+            num_beams=5,
+            no_repeat_ngram_size=4,
+            num_return_sequences=1,
+            do_sample = True,
+            top_p = 0.8,
+            pad_token_id=self.tokenizer.pad_token_id,
+            early_stopping=True,
+        )
+        result = self.tokenizer.batch_decode(wm_generation[:1,:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        print("watermarked model result:", result)
+        attention_mask_of_wm_generation=wm_generation.ne(self.tokenizer.pad_token_id)
+
+
+
+        with self.model.disable_adapter(), self.model.base_model_generate():
+            all_generation_outputs = self.model(
+                input_ids=torch.cat((base_generation, wm_generation)),
+                attention_mask=torch.cat((attention_mask_for_wm_training, attention_mask_of_wm_generation)),
+            )
+
+            base_label = torch.ones_like(base_generation)
+            base_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
+            base_label = base_label.flatten()
+            wm_label = torch.zeros_like(wm_generation)
+            wm_label[attention_mask_of_wm_generation == False] = IGNORE_INDEX
+            wm_label = wm_label.flatten()
+            discriminator_label = torch.cat((base_label, wm_label)).float()
+            
+            watermark_prob = all_generation_outputs.watermark_prob.flatten()
+
+            watermark_prob = watermark_prob[discriminator_label != IGNORE_INDEX]
+            discriminator_label = discriminator_label[discriminator_label != IGNORE_INDEX]
+
+            discriminator_loss = discriminator_loss_func(watermark_prob, discriminator_label)
+
+
+        loss = generator_loss + discriminator_loss
+        print("input_ids:", input_ids.shape, "label:", labels.shape, "loss:", loss.detach().cpu().item(), "generator_loss:", generator_loss.detach().cpu().item(), "discriminator_loss:", discriminator_loss.detach().cpu().item())
+
+        return WatermarkCausalLMOutputWithPast(
+            loss=loss,
+            generator_loss=generator_loss,
+            discriminator_loss=discriminator_loss,
+            logits=logits,
+            watermark_prob=watermark_prob,
+            discriminator_label=discriminator_label,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
