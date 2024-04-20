@@ -26,6 +26,7 @@ class WatermarkTrainer(Trainer):
             "generator_loss": get_item(self.outputs.generator_loss),
             "discriminator_loss": get_item(self.outputs.discriminator_loss),
             "discriminator_acc": get_item(get_acc(self.outputs.watermark_prob, self.outputs.discriminator_label)),
+            "stage": -1*int(self.model.discriminator_stage) + int(self.model.generator_stage),
             "loss_alpha": self.model.loss_alpha,
         }}
         super().log(logs)
