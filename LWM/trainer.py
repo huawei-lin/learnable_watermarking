@@ -10,14 +10,23 @@ class WatermarkTrainer(Trainer):
         self.outputs = None
 
     def log(self, logs: Dict[str, float]) -> None:
+        def get_item(x):
+            return x.item() if x is not None else 0
+
         def get_acc(pred, label):
+            if pred is None or label is None:
+                return None
             pred[pred >= 0] = 1
             pred[pred < 0] = 0
+            print("pred:", pred)
+            print("label:", label)
             return torch.sum(pred == label)/len(pred)
+
         logs = {**logs, **{
-            "generator_loss": self.outputs.generator_loss.item(),
-            "discriminator_loss": self.outputs.discriminator_loss.item(),
-            "discriminator_acc": get_acc(self.outputs.watermark_prob, self.outputs.discriminator_label).item(),
+            "generator_loss": get_item(self.outputs.generator_loss),
+            "discriminator_loss": get_item(self.outputs.discriminator_loss),
+            "discriminator_acc": get_item(get_acc(self.outputs.watermark_prob, self.outputs.discriminator_label)),
+            "loss_alpha": self.model.loss_alpha,
         }}
         super().log(logs)
 

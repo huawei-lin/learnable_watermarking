@@ -34,39 +34,27 @@ class Discriminator(nn.Module):
         else:
             hidden_size_list = hidden_sizes + [1]
 
-        self.layer_list = nn.ModuleList([nn.Linear(hidden_size_list[i],
+        '''
+        Name the discriminator layer with 'lora_' to pretend to be a lora adapter
+        Peft lora will set all the module which name with 'lora_' to trainable
+        https://github.com/huggingface/peft/blob/5a4b9cade64bac8afdff5006ee9dd815c90b5469/src/peft/tuners/lora/model.py#L253
+        '''
+        self.lora_layer_list = nn.ModuleList([nn.Linear(hidden_size_list[i],
             hidden_size_list[i + 1]) for i in range(len(hidden_size_list) - 1)])
-        # self.sigmoid = nn.Sigmoid()
 
     def forward(self, hidden_states):
-        for layer in self.layer_list:
+        for layer in self.lora_layer_list:
             hidden_states = layer(hidden_states)
-        # hidden_states = self.sigmoid(hidden_states)
         return hidden_states
 
 
-class WMLlamaForCausalLM(LlamaForCausalLM, nn.Module):
+class WMLlamaForCausalLM(LlamaForCausalLM):
     def __init__(self, config):
-        super(LlamaForCausalLM, self).__init__(config)
+        super().__init__(config)
         print(config)
 
-        self.model = LlamaModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.discriminator = Discriminator([config.hidden_size, 1024, 64])
-
+        self.discriminator = Discriminator([config.hidden_size, 512, 32])
         self.post_init()
-
-    @contextmanager
-    def base_model_generate(self):
-        try:
-            self.model.eval()
-            self.lm_head.eval()
-            self.discriminator.train()
-            yield
-        finally:
-            self.model.eval()
-            self.lm_head.eval()
-            self.discriminator.train()
 
     def forward(
         self,
@@ -104,18 +92,30 @@ class WMLlamaForCausalLM(LlamaForCausalLM, nn.Module):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-        watermark_prob = self.discriminator(hidden_states)
+        logits = self.lm_head(hidden_states.clone())
+        watermark_prob = self.discriminator(hidden_states.clone())
 
 
         loss = None
+#         if labels is not None:
+#             # Shift so that tokens < n predict n
+#             shift_logits = logits[..., :-1, :].contiguous()
+#             shift_labels = labels[..., 1:].contiguous()
+#             # Flatten the tokens
+#             loss_fct = CrossEntropyLoss()
+#             shift_logits = shift_logits.view(-1, self.config.vocab_size)
+#             shift_labels = shift_labels.view(-1)
+#             # Enable model parallelism
+#             shift_labels = shift_labels.to(shift_logits.device)
+#             loss = loss_fct(shift_logits, shift_labels)
+
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
         
 
         return WatermarkCausalLMOutputWithPast(
-            loss=loss,
+            # loss=loss,
             logits=logits,
             watermark_prob=watermark_prob,
             past_key_values=outputs.past_key_values,
@@ -124,10 +124,10 @@ class WMLlamaForCausalLM(LlamaForCausalLM, nn.Module):
         )
 
 
-# class AllInOneModel(PeftModel, nn.Module):
 class AllInOneModel(nn.Module):
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, loss_alpha=0.5):
         nn.Module.__init__(self)
+        self.loss_alpha = loss_alpha
         self.model = model
         self.tokenizer = tokenizer
         for name, param in self.named_parameters():
@@ -148,20 +148,12 @@ class AllInOneModel(nn.Module):
         return_dict: Optional[bool] = None,
         **kwargs,
     ):
-        '''
-        1. Base model generation.
-        2. Lora model generation.
-        3. Compare base model generation and lora model generation: Generation Loss.
-        4. Get classifier result and label: Descriminator Loss.
-        5. Define the combination of two losses.
-        '''
         generator_loss = None
         discriminator_loss = None
         discriminator_loss_func = BCEWithLogitsLoss()
 
         print("***"*20)
-        # 1. Base model generation.
-        with self.model.disable_adapter(), self.model.base_model_generate():
+        with self.model.disable_adapter():
             base_generation = self.model.generate(
                 input_ids,
                 max_length=512,
@@ -177,13 +169,12 @@ class AllInOneModel(nn.Module):
             result = self.tokenizer.batch_decode(base_generation[:1,:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
             print("base model result:", result)
 
+        attention_mask_for_wm_training = base_generation.ne(self.tokenizer.pad_token_id)
 
-        attention_mask_for_wm_training=base_generation.ne(self.tokenizer.pad_token_id)
-
-        # construct labels
         labels = base_generation.detach().clone()
         labels[:, :input_ids.shape[-1]] = IGNORE_INDEX
         labels[base_generation == self.tokenizer.pad_token_id] = IGNORE_INDEX
+
 
         outputs = self.model(
             input_ids=base_generation,
@@ -236,41 +227,47 @@ class AllInOneModel(nn.Module):
         print("watermarked model result:", result)
         attention_mask_of_wm_generation=wm_generation.ne(self.tokenizer.pad_token_id)
 
-
-
-        with self.model.disable_adapter(), self.model.base_model_generate():
+        with self.model.disable_adapter():
+            diff = base_generation.shape[-1] - wm_generation.shape[-1]
+    
+            base_generation = F.pad(base_generation, (0, -diff if diff < 0 else 0, 0, 0), value=self.tokenizer.pad_token_id)
+            wm_generation = F.pad(wm_generation, (0, diff if diff > 0 else 0, 0, 0), value=self.tokenizer.pad_token_id)
+            attention_mask_for_wm_training = F.pad(attention_mask_for_wm_training, (0, -diff if diff < 0 else 0, 0, 0), value=False)
+            attention_mask_of_wm_generation = F.pad(attention_mask_of_wm_generation, (0, diff if diff > 0 else 0, 0, 0), value=False)
+    
+            all_generation = torch.cat((base_generation, wm_generation))
+            all_attn_mask = torch.cat((attention_mask_for_wm_training, attention_mask_of_wm_generation))
+    
             all_generation_outputs = self.model(
-                input_ids=torch.cat((base_generation, wm_generation)),
-                attention_mask=torch.cat((attention_mask_for_wm_training, attention_mask_of_wm_generation)),
+                input_ids=all_generation,
+                attention_mask=all_attn_mask,
             )
-
+    
             base_label = torch.ones_like(base_generation)
             base_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
+            base_label[:, int(base_label.shape[-1]*0.1):] = IGNORE_INDEX
             base_label = base_label.flatten()
             wm_label = torch.zeros_like(wm_generation)
             wm_label[attention_mask_of_wm_generation == False] = IGNORE_INDEX
+            wm_label[:, int(wm_label.shape[-1]*0.1):] = IGNORE_INDEX
             wm_label = wm_label.flatten()
             discriminator_label = torch.cat((base_label, wm_label)).float()
-            
+    
             watermark_prob = all_generation_outputs.watermark_prob.flatten()
-
+    
             watermark_prob = watermark_prob[discriminator_label != IGNORE_INDEX]
             discriminator_label = discriminator_label[discriminator_label != IGNORE_INDEX]
+    
+            discriminator_loss = discriminator_loss_func(watermark_prob, discriminator_label.float())
 
-            discriminator_loss = discriminator_loss_func(watermark_prob, discriminator_label)
-
-
-        loss = generator_loss + discriminator_loss
-        print("input_ids:", input_ids.shape, "label:", labels.shape, "loss:", loss.detach().cpu().item(), "generator_loss:", generator_loss.detach().cpu().item(), "discriminator_loss:", discriminator_loss.detach().cpu().item())
+        # loss = discriminator_loss
+        # loss = generator_loss 
+        loss = self.loss_alpha*generator_loss + (1 - self.loss_alpha)*discriminator_loss
 
         return WatermarkCausalLMOutputWithPast(
             loss=loss,
             generator_loss=generator_loss,
             discriminator_loss=discriminator_loss,
-            logits=logits,
             watermark_prob=watermark_prob,
             discriminator_label=discriminator_label,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
         )

@@ -77,7 +77,7 @@ class SupervisedDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        return dict(input_ids=self.input_ids[i])
+        return dict(input_ids=self.input_ids[i], labels=self.input_ids[i])
 
 
 @dataclass
@@ -95,6 +95,7 @@ class DataCollatorForSupervisedDataset(object):
         attention_mask=input_ids.ne(self.tokenizer.pad_token_id)
         return dict(
             input_ids=input_ids,
+            labels=input_ids,
             attention_mask=attention_mask
         )
 
@@ -112,6 +113,13 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
 def get_model_tokenizer(training_args, model_args, other_args):
     model = None
     bnb_config = None
+    if other_args.load_in_8bit == True or other_args.load_in_4bit == True \
+        or training_args.bf16 == True or training_args.fp16 == True:
+        raise ValueError(
+            f"There is an unknown bug: load model in 8bit or 4bit will cause none grad"
+            " please disable all quantization methods"
+        )
+
     if other_args.load_in_8bit == True or other_args.load_in_4bit == True:
         load_in_4bit = other_args.load_in_4bit
         load_in_8bit = False if load_in_4bit else other_args.load_in_8bit
@@ -125,11 +133,14 @@ def get_model_tokenizer(training_args, model_args, other_args):
 
     print(f"model: {model_args.model_name_or_path}")
     model = WMLlamaForCausalLM.from_pretrained(
+    # model = LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         quantization_config=bnb_config,
     )
-    if other_args.load_in_8bit == True or other_args.load_in_4bit == True:
-        model = prepare_model_for_kbit_training(model)
+
+    # BUG: use prepare_model_for_kbit_training will change the model behavior
+#     if other_args.load_in_8bit == True or other_args.load_in_4bit == True:
+#         model = prepare_model_for_kbit_training(model)
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -148,9 +159,10 @@ def get_model_tokenizer(training_args, model_args, other_args):
             lora_dropout=0.05,
             bias="none",
             task_type="CAUSAL_LM",
+            init_lora_weights=False,
         )
         print("Use LoRA:", config)
-    
+
         model.enable_input_require_grads()
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
@@ -158,25 +170,26 @@ def get_model_tokenizer(training_args, model_args, other_args):
         model.is_parallelizable = True
         model.model_parallel = True
 
-    model = AllInOneModel(model, tokenizer)
+    model = AllInOneModel(model, tokenizer, other_args.loss_alpha)
 
-    if training_args.resume_from_checkpoint:
-        # Check the available weights and load them
-        checkpoint_name = os.path.join(
-            training_args.resume_from_checkpoint, "pytorch_model.bin"
-        )  # Full checkpoint
-        if not os.path.exists(checkpoint_name) and other_args.use_lora:
-            checkpoint_name = os.path.join(
-                training_args.resume_from_checkpoint, "adapter_model.bin"
-            )  # only LoRA model - LoRA config above has to fit
-            training_args.resume_from_checkpoint = (
-                False  # So the trainer won't try loading its state
-            )
-        # The two files above have a different name depending on how they were saved, but are actually the same.
-        if os.path.exists(checkpoint_name):
-            print(f"Restarting from {checkpoint_name}")
-            adapters_weights = torch.load(checkpoint_name)
-            set_peft_model_state_dict(model, adapters_weights)
-        else:
-            print(f"Checkpoint {checkpoint_name} not found")
+    # TODO: load a checkpoint
+#     if training_args.resume_from_checkpoint:
+#         # Check the available weights and load them
+#         checkpoint_name = os.path.join(
+#             training_args.resume_from_checkpoint, "pytorch_model.bin"
+#         )  # Full checkpoint
+#         if not os.path.exists(checkpoint_name) and other_args.use_lora:
+#             checkpoint_name = os.path.join(
+#                 training_args.resume_from_checkpoint, "adapter_model.bin"
+#             )  # only LoRA model - LoRA config above has to fit
+#             training_args.resume_from_checkpoint = (
+#                 False  # So the trainer won't try loading its state
+#             )
+#         # The two files above have a different name depending on how they were saved, but are actually the same.
+#         if os.path.exists(checkpoint_name):
+#             print(f"Restarting from {checkpoint_name}")
+#             adapters_weights = torch.load(checkpoint_name)
+#             set_peft_model_state_dict(model, adapters_weights)
+#         else:
+#             print(f"Checkpoint {checkpoint_name} not found")
     return model, tokenizer
