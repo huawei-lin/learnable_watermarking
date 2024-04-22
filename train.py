@@ -17,7 +17,7 @@ def train():
     print(other_args, other_args.use_lora)
 
     model, tokenizer = get_model_tokenizer(training_args, model_args, other_args)
-    model = model.to(0)
+    print(model)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = WatermarkTrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
