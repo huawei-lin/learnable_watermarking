@@ -37,23 +37,16 @@ class WatermarkTrainer(Trainer):
             "base_model_generation",
             "watermarked_generation",
         ])
-        for base_model_generation, watermarked_generation \
-            in zip(self.outputs.base_model_generation, self.outputs.watermarked_generation):
-
-            text_table.add_data(generator_loss, discriminator_loss, discriminator_acc, \
-                base_model_generation, watermarked_generation)
-
-#         if self.is_world_process_zero():
-#             for base_model_generation, watermarked_generation \
-#                 in zip(self.outputs.base_model_generation, self.outputs.watermarked_generation):
-#         
-#                 text_table.add_data(generator_loss, discriminator_loss, discriminator_acc, \
-#                     base_model_generation, watermarked_generation)
-#     
-#             for callback in self.callback_handler.callbacks:
-#                 if isinstance(callback, WandbCallback):
-#                     print("_initialized:", callback._initialized)
-#                     callback._wandb.log({"samples_vis": text_table}, commit=False)
+        if self.is_world_process_zero():
+            for base_model_generation, watermarked_generation \
+                in zip(self.outputs.base_model_generation, self.outputs.watermarked_generation):
+        
+                text_table.add_data(generator_loss, discriminator_loss, discriminator_acc, \
+                    base_model_generation, watermarked_generation)
+    
+            for callback in self.callback_handler.callbacks:
+                if isinstance(callback, WandbCallback):
+                    callback._wandb.log({"samples_vis": text_table}, commit=False)
 
         logs = {**logs, **{
             "generator_loss": generator_loss,
@@ -61,7 +54,6 @@ class WatermarkTrainer(Trainer):
             "discriminator_acc": discriminator_acc,
             "stage": stage,
             "loss_alpha": loss_alpha,
-            "samples_vis": text_table,
         }}
         super().log(logs)
 

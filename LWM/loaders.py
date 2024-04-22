@@ -131,6 +131,7 @@ def get_model_tokenizer(training_args, model_args, other_args):
             bnb_4bit_compute_dtype=torch.float16,
         )
 
+    # "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/save_model_alpha0.95_ne5_llama2_7b_qvko_r8_a16_lr1e-4_bs0/checkpoint-8",
     print(f"model: {model_args.model_name_or_path}")
     model = WMLlamaForCausalLM.from_pretrained(
     # model = LlamaForCausalLM.from_pretrained(
@@ -171,6 +172,10 @@ def get_model_tokenizer(training_args, model_args, other_args):
         model.model_parallel = True
 
     model = AllInOneModel(model, tokenizer, other_args.loss_alpha)
+#     for param_tensor in model.state_dict():
+#         print(param_tensor, "\t", model.state_dict()[param_tensor].size(), model.state_dict()[param_tensor].sum())
+#     exit()
+
 
     # TODO: load a checkpoint
 #     if training_args.resume_from_checkpoint:

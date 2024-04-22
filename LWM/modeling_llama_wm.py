@@ -1,14 +1,18 @@
+import os
 import transformers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from transformers.configuration_utils import PretrainedConfig
 from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
 from dataclasses import dataclass, field
 from transformers.utils import ModelOutput
-from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel
+from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel, LlamaDecoderLayer
 from peft.peft_model import PeftModel
 from contextlib import contextmanager, nullcontext
+from .patching import llama_model_forward
+import copy
 
 IGNORE_INDEX = -100
 
@@ -28,27 +32,44 @@ class WatermarkCausalLMOutputWithPast(ModelOutput):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, hidden_sizes):
+    def __init__(self, config):
         super().__init__()
-        hidden_size_list = None
-        if isinstance(hidden_sizes, int):
-            hidden_size_list = [hidden_sizes, 1]
-        else:
-            hidden_size_list = hidden_sizes + [1]
-
         '''
         Name the discriminator layer with 'lora_' to pretend to be a lora adapter
         Peft lora will set all the module which name with 'lora_' to trainable
         https://github.com/huggingface/peft/blob/5a4b9cade64bac8afdff5006ee9dd815c90b5469/src/peft/tuners/lora/model.py#L253
         '''
         self.lora_layer_list = nn.ModuleList()
-        for i in range(len(hidden_size_list) - 1):
-            self.lora_layer_list.append(nn.Linear(hidden_size_list[i], hidden_size_list[i + 1]))
-            if hidden_size_list[i + 1] != 1:
-                self.lora_layer_list.append(nn.SiLU())
+        self.lora_layer_list.append(LlamaDecoderLayer(config, config.num_hidden_layers))
+        self.lora_layer_list.append(nn.Linear(4096, 512))
+        self.lora_layer_list.append(nn.SiLU())
+        self.lora_layer_list.append(nn.Linear(512, 32))
+        self.lora_layer_list.append(nn.SiLU())
+        self.lora_layer_list.append(nn.Linear(32, 1))
 
-    def forward(self, hidden_states):
-        for layer in self.lora_layer_list:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        layer_outputs = self.lora_layer_list[0](
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+        )
+        hidden_states = layer_outputs[0]
+
+        for layer in self.lora_layer_list[1:]:
             hidden_states = layer(hidden_states)
         return hidden_states
 
@@ -57,8 +78,13 @@ class WMLlamaForCausalLM(LlamaForCausalLM):
     def __init__(self, config):
         super().__init__(config)
 
-        self.discriminator = Discriminator([config.hidden_size, 1024, 64])
+        # self.discriminator = Discriminator([config.hidden_size, 1024, 64])
+        self.discriminator = Discriminator(config)
         self.post_init()
+
+        # Monkey Patching
+        self.model.forward = llama_model_forward
+         
 
     def forward(
         self,
@@ -83,6 +109,7 @@ class WMLlamaForCausalLM(LlamaForCausalLM):
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
+            self.model,
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -97,7 +124,17 @@ class WMLlamaForCausalLM(LlamaForCausalLM):
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states.clone())
-        watermark_prob = self.discriminator(hidden_states.clone())
+
+        # watermark_prob = self.discriminator(hidden_states.clone())
+        watermark_prob = self.discriminator(
+            hidden_states.clone(),
+            attention_mask=self.model._attention_mask,
+            position_ids=self.model._position_ids,
+            past_key_value=self.model._past_key_value,
+            output_attentions=self.model._output_attentions,
+            use_cache=self.model._use_cache,
+            cache_position=self.model._cache_position,
+        )
 
 
         loss = None
@@ -127,8 +164,42 @@ class WMLlamaForCausalLM(LlamaForCausalLM):
             attentions=outputs.attentions,
         )
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
+        *model_args,
+        config: Optional[Union[PretrainedConfig, str, os.PathLike]] = None,
+        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        ignore_mismatched_sizes: bool = False,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[Union[str, bool]] = None,
+        revision: str = "main",
+        use_safetensors: bool = None,
+        **kwargs,
+    ):
+        model = super().from_pretrained(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            *model_args,
+            config=config,
+            cache_dir=cache_dir,
+            ignore_mismatched_sizes=ignore_mismatched_sizes,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            use_safetensors=use_safetensors,
+            **kwargs,
+        )
 
-class AllInOneModel(nn.Module):
+        discriminator_layer_idx = model.discriminator.lora_layer_list[0].self_attn.layer_idx
+        model.discriminator.lora_layer_list[0] = copy.deepcopy(model.model.layers[-1])
+        model.discriminator.lora_layer_list[0].self_attn.layer_idx = discriminator_layer_idx
+        return model
+
+
+class AllInOneModel(LlamaForCausalLM, nn.Module):
     def __init__(self, model, tokenizer, loss_alpha=0.5):
         nn.Module.__init__(self)
         self.loss_alpha = loss_alpha
@@ -138,8 +209,8 @@ class AllInOneModel(nn.Module):
         self.discriminator_stage = True
         self.generator_stage = True
 
-        self.discriminator_num = 10
-        self.generator_num = 10
+        self.discriminator_num = 20
+        self.generator_num = 20
         self.first_loop = True
 
         self.total_cnt = 0
@@ -186,6 +257,7 @@ class AllInOneModel(nn.Module):
             self.total_cnt += 1
 
         if self.total_cnt >= self.discriminator_num + self.generator_num:
+            self.discriminator_num = 5000
             self.first_loop = False
             self.total_cnt = 0
 
@@ -231,8 +303,7 @@ class AllInOneModel(nn.Module):
         labels[:, :input_ids.shape[-1]] = IGNORE_INDEX
         labels[base_generation == self.tokenizer.pad_token_id] = IGNORE_INDEX
 
-        with nullcontext() if self.generator_stage else torch.no_grad():
-            with self.mark_discriminator_as_untrainable():
+        with self.mark_discriminator_as_untrainable() if self.generator_stage else torch.no_grad():
                 outputs = self.model(
                     input_ids=base_generation,
                     attention_mask=attention_mask_for_wm_training,
@@ -288,14 +359,7 @@ class AllInOneModel(nn.Module):
         watermarked_generation = self.tokenizer.batch_decode(wm_generation[:1,:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
         attention_mask_of_wm_generation=wm_generation.ne(self.tokenizer.pad_token_id)
 
-#         with self.mark_adapters_as_untrainable() \
-#             if (self.first_loop and self.discriminator_stage and not self.generator_stage) \
-#             else nullcontext():
-        with nullcontext() if self.discriminator_stage else torch.no_grad():
-            with self.mark_adapters_as_untrainable():
-    #             if self.generator_stage == False:
-    #                 self.model.zero_grad()
-    
+        with self.mark_adapters_as_untrainable() if self.discriminator_stage else torch.no_grad():
                 diff = base_generation.shape[-1] - wm_generation.shape[-1]
 
                 base_generation = F.pad(base_generation, (0, -diff if diff < 0 else 0, 0, 0), value=self.tokenizer.pad_token_id)
@@ -313,11 +377,11 @@ class AllInOneModel(nn.Module):
 
                 base_label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/5
                 base_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
-                base_label[:, :int(base_label.shape[-1]*0.1)] = IGNORE_INDEX
+                # base_label[:, :int(base_label.shape[-1]*0.1)] = IGNORE_INDEX
                 base_label = base_label.flatten()
                 wm_label = torch.zeros_like(wm_generation) + torch.rand(wm_generation.shape, device=wm_generation.device)/5
                 wm_label[attention_mask_of_wm_generation == False] = IGNORE_INDEX
-                wm_label[:, :int(wm_label.shape[-1]*0.1)] = IGNORE_INDEX
+                # wm_label[:, :int(wm_label.shape[-1]*0.1)] = IGNORE_INDEX
                 wm_label = wm_label.flatten()
                 discriminator_label = torch.cat((base_label, wm_label)).float()
 
