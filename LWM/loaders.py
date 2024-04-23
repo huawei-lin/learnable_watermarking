@@ -8,11 +8,10 @@ from datasets import load_dataset
 from torch.utils.data import Dataset
 from dataclasses import dataclass, field
 from transformers import AutoTokenizer, LlamaForCausalLM, BitsAndBytesConfig, AutoModelForCausalLM
-from LWM.modeling_llama_wm import WMLlamaForCausalLM, AllInOneModel
+from LWM.modeling_llama_wm import WMLlamaForCausalLM, AllInOneModel, WatermarkedLlama
 from peft import (
     LoraConfig,
     get_peft_model,
-    get_peft_model_state_dict,
     prepare_model_for_kbit_training,
     set_peft_model_state_dict,
 )
@@ -131,10 +130,8 @@ def get_model_tokenizer(training_args, model_args, other_args):
             bnb_4bit_compute_dtype=torch.float16,
         )
 
-    # "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/save_model_alpha0.95_ne5_llama2_7b_qvko_r8_a16_lr1e-4_bs0/checkpoint-8",
     print(f"model: {model_args.model_name_or_path}")
-    model = WMLlamaForCausalLM.from_pretrained(
-    # model = LlamaForCausalLM.from_pretrained(
+    model = LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         quantization_config=bnb_config,
     )
@@ -170,6 +167,8 @@ def get_model_tokenizer(training_args, model_args, other_args):
         model.config.use_cache = False
         model.is_parallelizable = True
         model.model_parallel = True
+
+    model = WatermarkedLlama(model)
 
     model = AllInOneModel(model, tokenizer, other_args.loss_alpha)
 #     for param_tensor in model.state_dict():

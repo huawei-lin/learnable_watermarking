@@ -30,6 +30,9 @@ class WatermarkCausalLMOutputWithPast(ModelOutput):
     base_model_generation: Optional[Tuple[str]] = None
     watermarked_generation: Optional[Tuple[str]] = None
 
+@dataclass
+class WatermarkConfig():
+    pass
 
 class Discriminator(nn.Module):
     def __init__(self, config):
@@ -74,17 +77,25 @@ class Discriminator(nn.Module):
         return hidden_states
 
 
-class WMLlamaForCausalLM(LlamaForCausalLM):
-    def __init__(self, config):
-        super().__init__(config)
+class WatermarkedLlama(nn.Module):
+    def __init__(self, peft_model, watermark_config: Optional[WatermarkConfig] = None):
+        nn.Module.__init__(self)
 
-        # self.discriminator = Discriminator([config.hidden_size, 1024, 64])
-        self.discriminator = Discriminator(config)
-        self.post_init()
+        self.watermark_config = watermark_config
+        self.peft_model = peft_model
+        self.discriminator = Discriminator(peft_model.config)
 
-        # Monkey Patching
-        self.model.forward = llama_model_forward
-         
+        # Copy the last decoder layer to discriminator
+        discriminator_layer_idx = self.discriminator.lora_layer_list[0].self_attn.layer_idx
+        self.discriminator.lora_layer_list[0] = copy.deepcopy(self.get_decoder().layers[-1])
+        self.discriminator.lora_layer_list[0].self_attn.layer_idx = discriminator_layer_idx
+
+    def __getattr__(self, name: str):
+        """Forward missing attributes to the wrapped module."""
+        try:
+            return super().__getattr__(name)  # defer to nn.Module's logic
+        except AttributeError:
+            return getattr(self.peft_model, name)
 
     def forward(
         self,
@@ -101,15 +112,9 @@ class WMLlamaForCausalLM(LlamaForCausalLM):
         **kwargs,
     ) -> Union[Tuple, WatermarkCausalLMOutputWithPast]:
 
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
-            self.model,
+        # outputs = self.peft_model(
+        outputs = self.get_decoder()(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -123,80 +128,26 @@ class WMLlamaForCausalLM(LlamaForCausalLM):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states.clone())
 
-        # watermark_prob = self.discriminator(hidden_states.clone())
+        logits = self.get_output_embeddings()(hidden_states.clone())
+
         watermark_prob = self.discriminator(
             hidden_states.clone(),
-            attention_mask=self.model._attention_mask,
-            position_ids=self.model._position_ids,
-            past_key_value=self.model._past_key_value,
-            output_attentions=self.model._output_attentions,
-            use_cache=self.model._use_cache,
-            cache_position=self.model._cache_position,
+            attention_mask=self.get_decoder()._attention_mask,
+            position_ids=self.get_decoder()._position_ids,
+            past_key_value=self.get_decoder()._past_key_value,
+            output_attentions=self.get_decoder()._output_attentions,
+            use_cache=self.get_decoder()._use_cache,
+            cache_position=self.get_decoder()._cache_position,
         )
 
-
-        loss = None
-#         if labels is not None:
-#             # Shift so that tokens < n predict n
-#             shift_logits = logits[..., :-1, :].contiguous()
-#             shift_labels = labels[..., 1:].contiguous()
-#             # Flatten the tokens
-#             loss_fct = CrossEntropyLoss()
-#             shift_logits = shift_logits.view(-1, self.config.vocab_size)
-#             shift_labels = shift_labels.view(-1)
-#             # Enable model parallelism
-#             shift_labels = shift_labels.to(shift_logits.device)
-#             loss = loss_fct(shift_logits, shift_labels)
-
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-        
-
         return WatermarkCausalLMOutputWithPast(
-            # loss=loss,
             logits=logits,
             watermark_prob=watermark_prob,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
-        *model_args,
-        config: Optional[Union[PretrainedConfig, str, os.PathLike]] = None,
-        cache_dir: Optional[Union[str, os.PathLike]] = None,
-        ignore_mismatched_sizes: bool = False,
-        force_download: bool = False,
-        local_files_only: bool = False,
-        token: Optional[Union[str, bool]] = None,
-        revision: str = "main",
-        use_safetensors: bool = None,
-        **kwargs,
-    ):
-        model = super().from_pretrained(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            *model_args,
-            config=config,
-            cache_dir=cache_dir,
-            ignore_mismatched_sizes=ignore_mismatched_sizes,
-            force_download=force_download,
-            local_files_only=local_files_only,
-            token=token,
-            revision=revision,
-            use_safetensors=use_safetensors,
-            **kwargs,
-        )
-
-        discriminator_layer_idx = model.discriminator.lora_layer_list[0].self_attn.layer_idx
-        model.discriminator.lora_layer_list[0] = copy.deepcopy(model.model.layers[-1])
-        model.discriminator.lora_layer_list[0].self_attn.layer_idx = discriminator_layer_idx
-        return model
 
 
 class AllInOneModel(LlamaForCausalLM, nn.Module):
