@@ -252,6 +252,8 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         discriminator_loss = None
         discriminator_loss_func = BCEWithLogitsLoss()
 
+        batch_size, input_length = input_ids.shape
+
         with self.model.disable_adapter():
             base_generation = self.model.generate(
                 input_ids,
@@ -287,8 +289,10 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
                 **kwargs,
             )
             discriminator_label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/5
+            # discriminator_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
+            # discriminator_label[:, :int(discriminator_label.shape[-1]*0.1)] = IGNORE_INDEX
             discriminator_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
-            # label[:, :int(label.shape[-1]*0.1)] = IGNORE_INDEX
+            discriminator_label[:, :input_length] = IGNORE_INDEX
             discriminator_label = discriminator_label.flatten()
 
             watermark_prob = outputs.watermark_prob.flatten()
@@ -350,12 +354,14 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
                 base_label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/5
                 base_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
                 # base_label[:, :int(base_label.shape[-1]*0.1)] = IGNORE_INDEX
+                base_label[:, :input_length] = IGNORE_INDEX
                 base_label = base_label.flatten()
                 wm_label = torch.zeros_like(wm_generation) + torch.rand(wm_generation.shape, device=wm_generation.device)/5
                 wm_label[attention_mask_of_wm_generation == False] = IGNORE_INDEX
                 # wm_label[:, :int(wm_label.shape[-1]*0.1)] = IGNORE_INDEX
+                wm_label[:, :input_length] = IGNORE_INDEX
                 wm_label = wm_label.flatten()
-                discriminator_label = torch.cat((base_label, wm_label)).float()
+                discriminator_label = torch.cat((base_label, wm_label))
 
                 watermark_prob = all_generation_outputs.watermark_prob.flatten()
 
