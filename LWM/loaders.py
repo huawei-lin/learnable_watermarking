@@ -2,13 +2,15 @@ import torch
 import copy
 import json
 import logging
+import random
+random.seed(42)
 import transformers
 from typing import Dict, Optional, Sequence
 from datasets import load_dataset
 from torch.utils.data import Dataset
 from dataclasses import dataclass, field
 from transformers import AutoTokenizer, LlamaForCausalLM, BitsAndBytesConfig, AutoModelForCausalLM
-from LWM.modeling_llama_wm import WMLlamaForCausalLM, AllInOneModel, WatermarkedLlama
+from LWM.modeling_llama_wm import AllInOneModel, WatermarkedLlama
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -67,6 +69,7 @@ class SupervisedDataset(Dataset):
         sources = [
             example['instruction'] for example in list_data_dict
         ]
+        random.shuffle(sources)
         logging.warning("Tokenizing inputs... This may take some time...")
         data_dict = preprocess(sources, tokenizer)
 

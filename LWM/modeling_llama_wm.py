@@ -20,10 +20,10 @@ IGNORE_INDEX = -100
 class WatermarkCausalLMOutputWithPast(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     generator_loss: Optional[torch.FloatTensor] = None
-    discriminator_loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
     watermark_prob: Optional[torch.FloatTensor] = None
-    discriminator_label: Optional[torch.FloatTensor] = None
+    discriminator_loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    discriminator_acc: Optional[torch.FloatTensor] = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
@@ -160,11 +160,22 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         self.discriminator_stage = True
         self.generator_stage = True
 
-        self.discriminator_num = 20
-        self.generator_num = 20
+        self.discriminator_num = 40
+        self.generator_num = 5
         self.first_loop = True
 
         self.total_cnt = 0
+
+        self.queue_len = 3
+        self.queue_idx = 0
+        self.acc_queue = torch.zeros((self.queue_len))
+
+    def __getattr__(self, name: str):
+        """Forward missing attributes to the wrapped module."""
+        try:
+            return super().__getattr__(name)  # defer to nn.Module's logic
+        except AttributeError:
+            return getattr(self.model, name)
 
     @contextmanager
     def mark_adapters_as_untrainable(self):
@@ -195,22 +206,30 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         1. Train discriminator for num times
         2. Train discriminator and generator for num times
         '''
-        # discriminator first
-        if self.total_cnt < self.discriminator_num:
-            # discriminator stage
+        if self.first_loop == True and self.total_cnt == 0:
             self.discriminator_stage = True
             self.generator_stage = False
-            self.total_cnt += 1
-        elif self.total_cnt < self.discriminator_num + self.generator_num:
-            # generator stage
+
+        if self.discriminator_stage == True and self.acc_queue.mean() > 0.85:
             self.discriminator_stage = False
             self.generator_stage = True
-            self.total_cnt += 1
 
-        if self.total_cnt >= self.discriminator_num + self.generator_num:
-            self.discriminator_num = 5000
+        if self.generator_stage == True and self.acc_queue.mean() < 0.4:
+            self.discriminator_stage = True
+            self.generator_stage = False
+
+            self.total_cnt += 1
             self.first_loop = False
-            self.total_cnt = 0
+
+
+    def get_acc(self, pred, label):
+        if pred is None or label is None:
+            return None
+        pred[pred >= 0] = 1
+        pred[pred < 0] = 0
+        label[label >= 0.5] = 1
+        label[label < 0.5] = 0
+        return torch.sum(pred == label)/len(pred)
 
 
     def forward(
@@ -255,45 +274,45 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         labels[base_generation == self.tokenizer.pad_token_id] = IGNORE_INDEX
 
         with self.mark_discriminator_as_untrainable() if self.generator_stage else torch.no_grad():
-                outputs = self.model(
-                    input_ids=base_generation,
-                    attention_mask=attention_mask_for_wm_training,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    inputs_embeds=inputs_embeds,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    return_dict=return_dict,
-                    **kwargs,
-                )
-                label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/5
-                label[attention_mask_for_wm_training == False] = IGNORE_INDEX
-                # label[:, :int(label.shape[-1]*0.1)] = IGNORE_INDEX
-                label = label.flatten()
+            outputs = self.model(
+                input_ids=base_generation,
+                attention_mask=attention_mask_for_wm_training,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs,
+            )
+            label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/5
+            label[attention_mask_for_wm_training == False] = IGNORE_INDEX
+            # label[:, :int(label.shape[-1]*0.1)] = IGNORE_INDEX
+            label = label.flatten()
 
-                watermark_prob = outputs.watermark_prob.flatten()
+            watermark_prob = outputs.watermark_prob.flatten()
 
-                watermark_prob = watermark_prob[label != IGNORE_INDEX]
-                label = label[label != IGNORE_INDEX]
+            watermark_prob = watermark_prob[label != IGNORE_INDEX]
+            label = label[label != IGNORE_INDEX]
 
-                generator_loss = discriminator_loss_func(watermark_prob, label.float())
-#                 logits = outputs.logits
-#                 
-#                 result = torch.argmax(logits[:1], axis=2)
-#                 result = self.tokenizer.batch_decode(result[:1,:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            generator_loss = discriminator_loss_func(watermark_prob, label.float())
+#             logits = outputs.logits
 #             
-#                 if labels is not None:
-#                     # Shift so that tokens < n predict n
-#                     shift_logits = logits[..., :-1, :].contiguous()
-#                     shift_labels = labels[..., 1:].contiguous()
-#                     # Flatten the tokens
-#                     loss_fct = CrossEntropyLoss()
-#                     shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-#                     shift_labels = shift_labels.view(-1)
-#                     # Enable model parallelism
-#                     shift_labels = shift_labels.to(shift_logits.device)
-#                     generator_loss = loss_fct(shift_logits, shift_labels)
+#             result = torch.argmax(logits[:1], axis=2)
+#             result = self.tokenizer.batch_decode(result[:1,:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+#           
+#             if labels is not None:
+#                 # Shift so that tokens < n predict n
+#                 shift_logits = logits[..., :-1, :].contiguous()
+#                 shift_labels = labels[..., 1:].contiguous()
+#                 # Flatten the tokens
+#                 loss_fct = CrossEntropyLoss()
+#                 shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+#                 shift_labels = shift_labels.view(-1)
+#                 # Enable model parallelism
+#                 shift_labels = shift_labels.to(shift_logits.device)
+#                 generator_loss = loss_fct(shift_logits, shift_labels)
 
         wm_generation = self.model.generate(
             input_ids,
@@ -342,6 +361,11 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
                 discriminator_label = discriminator_label[discriminator_label != IGNORE_INDEX]
 
                 discriminator_loss = discriminator_loss_func(watermark_prob, discriminator_label.float())
+
+                discriminator_acc = self.get_acc(watermark_prob.detach().clone(), discriminator_label.detach().clone())
+
+                self.acc_queue[self.queue_idx] = discriminator_acc
+                self.queue_idx = (self.queue_idx + 1)%self.queue_len
             # end
 
         if self.generator_stage and self.discriminator_stage:
@@ -356,12 +380,12 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
                 " false at the same time."
             )
 
+
         return WatermarkCausalLMOutputWithPast(
             loss=loss,
             generator_loss=generator_loss,
             discriminator_loss=discriminator_loss,
-            watermark_prob=watermark_prob,
-            discriminator_label=discriminator_label,
+            discriminator_acc=discriminator_acc,
             base_model_generation=base_model_generation,
             watermarked_generation=watermarked_generation,
         )
