@@ -158,7 +158,7 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         self.tokenizer = tokenizer
 
         self.discriminator_stage = True
-        self.generator_stage = True
+        self.generator_stage = False
 
         self.discriminator_num = 40
         self.generator_num = 5
@@ -206,9 +206,10 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         1. Train discriminator for num times
         2. Train discriminator and generator for num times
         '''
-        if self.first_loop == True and self.total_cnt == 0:
-            self.discriminator_stage = True
-            self.generator_stage = False
+#         print(f"{self.acc_queue}, mean: {self.acc_queue.mean()}")
+#         if self.first_loop == True and self.total_cnt == 0:
+#             self.discriminator_stage = True
+#             self.generator_stage = False
 
         if self.discriminator_stage == True and self.acc_queue.mean() > 0.85:
             self.discriminator_stage = False
