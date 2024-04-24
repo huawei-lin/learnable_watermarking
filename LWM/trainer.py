@@ -6,6 +6,24 @@ from transformers.integrations.integration_utils import WandbCallback
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 import wandb
 import torch
+from transformers.utils import (
+    logging,
+    is_peft_available,
+    is_safetensors_available,
+    WEIGHTS_NAME,
+    SAFE_WEIGHTS_NAME
+)
+from transformers.modeling_utils import PreTrainedModel
+
+if is_safetensors_available():
+    import safetensors.torch
+
+if is_peft_available():
+    from peft import PeftModel
+
+logger = logging.get_logger(__name__)
+
+TRAINING_ARGS_NAME = "training_args.bin"
 
 
 class WatermarkTrainer(Trainer):
@@ -18,37 +36,21 @@ class WatermarkTrainer(Trainer):
             return x.item() if x is not None else 0
 
 
-        generator_loss = get_item(self.outputs.generator_loss)
-        discriminator_loss = get_item(self.outputs.discriminator_loss)
-        discriminator_acc = get_item(self.outputs.discriminator_acc)
-        stage = -1*int(self.model.discriminator_stage) + int(self.model.generator_stage)
-        loss_alpha = self.model.loss_alpha
-
         if self.is_world_process_zero():
             text_table = wandb.Table(columns=[
-                "generator_loss",
-                "discriminator_loss",
-                "discriminator_acc",
                 "base_model_generation",
                 "watermarked_generation",
             ])
             for idx, (base_model_generation, watermarked_generation) \
                 in enumerate(zip(self.outputs.base_model_generation, self.outputs.watermarked_generation)):
         
-                text_table.add_data(generator_loss, discriminator_loss, discriminator_acc, \
-                    base_model_generation, watermarked_generation)
+                text_table.add_data(base_model_generation, watermarked_generation)
     
             for callback in self.callback_handler.callbacks:
                 if isinstance(callback, WandbCallback):
                     callback._wandb.log({"samples_vis": text_table}, commit=False)
 
-        logs = {**logs, **{
-            "generator_loss": generator_loss,
-            "discriminator_loss": discriminator_loss,
-            "discriminator_acc": discriminator_acc,
-            "stage": stage,
-            "loss_alpha": loss_alpha,
-        }}
+        logs = {**logs, **self.outputs.logs}
         super().log(logs)
 
 
@@ -71,4 +73,39 @@ class WatermarkTrainer(Trainer):
 
         return super()._save_checkpoint(unwrapped_model.model.peft_model, trial, metrics)
 
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        # If we are executing this function, we are the process zero, so we don't check for that.
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Saving model checkpoint to {output_dir}")
+        model_to_save = self.model.peft_model ### DIFF
 
+        supported_classes = (PreTrainedModel,) if not is_peft_available() else (PreTrainedModel, PeftModel)
+        # Save a trained model and configuration using `save_pretrained()`.
+        # They can then be reloaded using `from_pretrained()`
+        if not isinstance(model_to_save, supported_classes):
+            if state_dict is None:
+                state_dict = model_to_save.state_dict()
+
+            if isinstance(unwrap_model(model_to_save), supported_classes):
+                unwrap_model(model_to_save).save_pretrained(
+                    output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
+                )
+            else:
+                logger.info("Trainer.model is not a `PreTrainedModel`, only saving its state dict.")
+                if self.args.save_safetensors:
+                    safetensors.torch.save_file(
+                        state_dict, os.path.join(output_dir, SAFE_WEIGHTS_NAME), metadata={"format": "pt"}
+                    )
+                else:
+                    torch.save(state_dict, os.path.join(output_dir, WEIGHTS_NAME))
+        else:
+            model_to_save.save_pretrained(
+                output_dir, state_dict=state_dict, safe_serialization=self.args.save_safetensors
+            )
+
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(output_dir)
+
+        # Good practice: save your training arguments together with the trained model
+        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
