@@ -1,3 +1,4 @@
+import os
 import torch
 import copy
 import json
@@ -180,23 +181,34 @@ def get_model_tokenizer(training_args, model_args, other_args):
 
 
     # TODO: load a checkpoint
-#     if training_args.resume_from_checkpoint:
-#         # Check the available weights and load them
-#         checkpoint_name = os.path.join(
-#             training_args.resume_from_checkpoint, "pytorch_model.bin"
-#         )  # Full checkpoint
-#         if not os.path.exists(checkpoint_name) and other_args.use_lora:
-#             checkpoint_name = os.path.join(
-#                 training_args.resume_from_checkpoint, "adapter_model.bin"
-#             )  # only LoRA model - LoRA config above has to fit
-#             training_args.resume_from_checkpoint = (
-#                 False  # So the trainer won't try loading its state
-#             )
-#         # The two files above have a different name depending on how they were saved, but are actually the same.
-#         if os.path.exists(checkpoint_name):
-#             print(f"Restarting from {checkpoint_name}")
-#             adapters_weights = torch.load(checkpoint_name)
-#             set_peft_model_state_dict(model, adapters_weights)
-#         else:
-#             print(f"Checkpoint {checkpoint_name} not found")
+    if training_args.resume_from_checkpoint:
+        # Check the available weights and load them
+        checkpoint_name = os.path.join(
+            training_args.resume_from_checkpoint, "pytorch_model.bin"
+        )  # Full checkpoint
+        if not os.path.exists(checkpoint_name):
+            adapter_checkpoint_name = os.path.join(
+                training_args.resume_from_checkpoint, "adapter_model.bin"
+            )  # only LoRA model - LoRA config above has to fit
+            discriminator_checkpoint_name = os.path.join(
+                training_args.resume_from_checkpoint, "discriminator.bin"
+            ) 
+            training_args.resume_from_checkpoint = (
+                False  # So the trainer won't try loading its state
+            )
+        # The two files above have a different name depending on how they were saved, but are actually the same.
+        if os.path.exists(adapter_checkpoint_name):
+            print(f"Restarting from {checkpoint_name}")
+            adapters_weights = torch.load(adapter_checkpoint_name)
+            set_peft_model_state_dict(model.model.peft_model, adapters_weights)
+        else:
+            print(f"Adapter checkpoint {checkpoint_name} not found")
+
+        if os.path.exists(discriminator_checkpoint_name):
+            print(f"Restarting from {checkpoint_name}")
+            discriminator_weights = torch.load(discriminator_checkpoint_name)
+            model.model.discriminator.load_state_dict(discriminator_weights)
+        else:
+            print(f"Discriminator checkpoint {checkpoint_name} not found")
+
     return model, tokenizer
