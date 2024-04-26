@@ -1,5 +1,6 @@
 import os
 import transformers
+import numpy as np
 from transformers import Trainer
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 from transformers.integrations.integration_utils import WandbCallback
@@ -39,12 +40,16 @@ class WatermarkTrainer(Trainer):
         if self.is_world_process_zero():
             text_table = wandb.Table(columns=[
                 "base_model_generation",
+                "gen_dis_pred",
                 "watermarked_generation",
+                "discriminator_pred",
             ])
-            for idx, (base_model_generation, watermarked_generation) \
-                in enumerate(zip(self.outputs.base_model_generation, self.outputs.watermarked_generation)):
-        
-                text_table.add_data(base_model_generation, watermarked_generation)
+            with np.printoptions(threshold=np.inf):
+                text_table.add_data(self.outputs.base_model_generation[0], str(self.outputs.gen_dis_pred.detach().cpu().numpy()), self.outputs.watermarked_generation[0], str(self.outputs.discriminator_pred.detach().cpu().numpy()))
+#             for idx, (base_model_generation, watermarked_generation) \
+#                 in enumerate(zip(self.outputs.base_model_generation, self.outputs.watermarked_generation)):
+#         
+#                 text_table.add_data(base_model_generation, watermarked_generation)
     
             for callback in self.callback_handler.callbacks:
                 if isinstance(callback, WandbCallback):

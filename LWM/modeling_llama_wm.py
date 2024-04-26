@@ -8,7 +8,12 @@ from transformers.configuration_utils import PretrainedConfig
 from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
 from dataclasses import dataclass, field
 from transformers.utils import ModelOutput
-from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel, LlamaDecoderLayer
+from transformers.models.llama.modeling_llama import (
+    LlamaForCausalLM,
+    LlamaModel,
+    LlamaDecoderLayer,
+    LlamaRMSNorm
+)
 from peft.peft_model import PeftModel
 from contextlib import contextmanager, nullcontext
 from .patching import llama_model_forward
@@ -16,12 +21,28 @@ import copy
 
 IGNORE_INDEX = -100
 
+
+transformers_output = {}
+def get_transformers_ouput(i):
+    # the hook signature
+    def hook(model, input, output):
+        transformers_output[i] = output[0]
+    return hook
+
+transformers_input_kwargs = {}
+def get_transformers_input(i):
+    # the hook signature
+    def hook(model, input, kwargs):
+        transformers_input_kwargs[i] = kwargs
+    return hook
+
+
 @dataclass
 class WatermarkCausalLMOutputWithPast(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
-    # generator_loss: Optional[torch.FloatTensor] = None
+    gen_dis_pred: Optional[torch.FloatTensor] = None
     watermark_prob: Optional[torch.FloatTensor] = None
-    # discriminator_loss: Optional[torch.FloatTensor] = None
+    discriminator_pred: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
@@ -30,9 +51,11 @@ class WatermarkCausalLMOutputWithPast(ModelOutput):
     watermarked_generation: Optional[Tuple[str]] = None
     logs: Optional[Dict[str, Any]] = None
 
+
 @dataclass
 class WatermarkConfig():
     pass
+
 
 class Discriminator(nn.Module):
     def __init__(self, config):
@@ -42,13 +65,16 @@ class Discriminator(nn.Module):
         Peft lora will set all the module which name with 'lora_' to trainable
         https://github.com/huggingface/peft/blob/5a4b9cade64bac8afdff5006ee9dd815c90b5469/src/peft/tuners/lora/model.py#L253
         '''
-        self.lora_layer_list = nn.ModuleList()
-        self.lora_layer_list.append(LlamaDecoderLayer(config, config.num_hidden_layers))
-        self.lora_layer_list.append(nn.Linear(4096, 512))
-        self.lora_layer_list.append(nn.SiLU())
-        self.lora_layer_list.append(nn.Linear(512, 32))
-        self.lora_layer_list.append(nn.SiLU())
-        self.lora_layer_list.append(nn.Linear(32, 1))
+        self.layers_num = 6
+
+        self.decoder_layer_list = nn.ModuleList([LlamaDecoderLayer(config, config.num_hidden_layers + i) for i in range(self.layers_num)])
+
+        self.mlp_layer_list = nn.ModuleList()
+        self.mlp_layer_list.append(nn.Linear(4096, 512))
+        self.mlp_layer_list.append(nn.SiLU())
+        self.mlp_layer_list.append(nn.Linear(512, 32))
+        self.mlp_layer_list.append(nn.SiLU())
+        self.mlp_layer_list.append(nn.Linear(32, 1))
 
     def forward(
         self,
@@ -61,19 +87,21 @@ class Discriminator(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
-        layer_outputs = self.lora_layer_list[0](
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-        )
-        hidden_states = layer_outputs[0]
+        for layer in self.decoder_layer_list:
+            layer_outputs = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+            hidden_states = layer_outputs[0]
 
-        for layer in self.lora_layer_list[1:]:
+        for layer in self.mlp_layer_list:
             hidden_states = layer(hidden_states)
+
         return hidden_states
 
 
@@ -83,12 +111,19 @@ class WatermarkedLlama(nn.Module):
 
         self.watermark_config = watermark_config
         self.peft_model = peft_model
+
+        self.disc_layernorm = LlamaRMSNorm(peft_model.config.hidden_size, eps=peft_model.config.rms_norm_eps)
         self.discriminator = Discriminator(peft_model.config)
 
         # Copy the last decoder layer to discriminator
-        discriminator_layer_idx = self.discriminator.lora_layer_list[0].self_attn.layer_idx
-        self.discriminator.lora_layer_list[0] = copy.deepcopy(self.get_decoder().layers[-1])
-        self.discriminator.lora_layer_list[0].self_attn.layer_idx = discriminator_layer_idx
+        for i in range(self.discriminator.layers_num):
+            discriminator_layer_idx = self.discriminator.decoder_layer_list[i].self_attn.layer_idx
+            self.discriminator.decoder_layer_list[i] = copy.deepcopy(self.get_decoder().layers[i - self.discriminator.layers_num])
+            self.discriminator.decoder_layer_list[i].self_attn.layer_idx = discriminator_layer_idx
+
+        for i, layer in enumerate(self.get_decoder().layers):
+            layer.register_forward_hook(get_transformers_ouput(i))
+        self.get_decoder().layers[0].register_forward_pre_hook(get_transformers_input(0), with_kwargs=True)
 
     def __getattr__(self, name: str):
         """Forward missing attributes to the wrapped module."""
@@ -131,14 +166,12 @@ class WatermarkedLlama(nn.Module):
 
         logits = self.get_output_embeddings()(hidden_states.clone())
 
+        transformers_output_sum = torch.stack(tuple(transformers_output.values())).sum(axis=0)
+
         watermark_prob = self.discriminator(
-            hidden_states.clone(),
-            attention_mask=self.get_decoder()._attention_mask,
-            position_ids=self.get_decoder()._position_ids,
-            past_key_value=self.get_decoder()._past_key_value,
-            output_attentions=self.get_decoder()._output_attentions,
-            use_cache=self.get_decoder()._use_cache,
-            cache_position=self.get_decoder()._cache_position,
+            # hidden_states.clone(),
+            self.disc_layernorm(transformers_output_sum),
+            **transformers_input_kwargs[0],
         )
 
         return WatermarkCausalLMOutputWithPast(
@@ -206,16 +239,12 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         1. Train discriminator for num times
         2. Train discriminator and generator for num times
         '''
-#         print(f"{self.acc_queue}, mean: {self.acc_queue.mean()}")
-#         if self.first_loop == True and self.total_cnt == 0:
-#             self.discriminator_stage = True
-#             self.generator_stage = False
 
         if self.discriminator_stage == True and self.acc_queue.mean() > 0.85:
             self.discriminator_stage = False
             self.generator_stage = True
 
-        if self.generator_stage == True and self.acc_queue.mean() < 0.4:
+        if self.generator_stage == True and self.acc_queue.mean() < 0.5:
             self.discriminator_stage = True
             self.generator_stage = False
 
@@ -226,8 +255,6 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
     def get_acc(self, pred, label):
         if pred is None or label is None:
             return None
-        pred[pred >= 0] = 1
-        pred[pred < 0] = 0
         label[label >= 0.5] = 1
         label[label < 0.5] = 0
         return torch.sum(pred == label)/len(pred)
@@ -301,6 +328,10 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             watermark_prob = watermark_prob[discriminator_label != IGNORE_INDEX]
             discriminator_label = discriminator_label[discriminator_label != IGNORE_INDEX]
 
+            gen_dis_pred = watermark_prob.detach().clone()
+            gen_dis_pred[gen_dis_pred >= 0] = 1
+            gen_dis_pred[gen_dis_pred < 0] = 0
+
             gen_discriminator_loss = discriminator_loss_func(watermark_prob, discriminator_label.float())
 
             logits = outputs.logits
@@ -318,7 +349,8 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             generation_loss = loss_fct(shift_logits, shift_labels)
-            generator_loss = 0.5*generation_loss + 0.5*gen_discriminator_loss
+
+            generator_loss = self.loss_alpha*generation_loss + (1 - self.loss_alpha)*gen_discriminator_loss
 
 
         wm_generation = self.model.generate(
@@ -337,49 +369,50 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         attention_mask_of_wm_generation=wm_generation.ne(self.tokenizer.pad_token_id)
 
         with self.mark_adapters_as_untrainable() if self.discriminator_stage else torch.no_grad():
-                diff = base_generation.shape[-1] - wm_generation.shape[-1]
+            diff = base_generation.shape[-1] - wm_generation.shape[-1]
 
-                base_generation = F.pad(base_generation, (0, -diff if diff < 0 else 0, 0, 0), value=self.tokenizer.pad_token_id)
-                wm_generation = F.pad(wm_generation, (0, diff if diff > 0 else 0, 0, 0), value=self.tokenizer.pad_token_id)
-                attention_mask_for_wm_training = F.pad(attention_mask_for_wm_training, (0, -diff if diff < 0 else 0, 0, 0), value=False)
-                attention_mask_of_wm_generation = F.pad(attention_mask_of_wm_generation, (0, diff if diff > 0 else 0, 0, 0), value=False)
+            base_generation = F.pad(base_generation, (0, -diff if diff < 0 else 0, 0, 0), value=self.tokenizer.pad_token_id)
+            wm_generation = F.pad(wm_generation, (0, diff if diff > 0 else 0, 0, 0), value=self.tokenizer.pad_token_id)
+            attention_mask_for_wm_training = F.pad(attention_mask_for_wm_training, (0, -diff if diff < 0 else 0, 0, 0), value=False)
+            attention_mask_of_wm_generation = F.pad(attention_mask_of_wm_generation, (0, diff if diff > 0 else 0, 0, 0), value=False)
 
-                all_generation = torch.cat((base_generation, wm_generation))
-                all_attn_mask = torch.cat((attention_mask_for_wm_training, attention_mask_of_wm_generation))
+            all_generation = torch.cat((base_generation, wm_generation))
+            all_attn_mask = torch.cat((attention_mask_for_wm_training, attention_mask_of_wm_generation))
 
-                all_generation_outputs = self.model(
-                    input_ids=all_generation,
-                    attention_mask=all_attn_mask,
-                )
+            all_generation_outputs = self.model(
+                input_ids=all_generation,
+                attention_mask=all_attn_mask,
+            )
 
-                base_label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/5
-                base_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
-                # base_label[:, :int(base_label.shape[-1]*0.1)] = IGNORE_INDEX
-                base_label[:, :input_length] = IGNORE_INDEX
-                base_label = base_label.flatten()
-                wm_label = torch.zeros_like(wm_generation) + torch.rand(wm_generation.shape, device=wm_generation.device)/5
-                wm_label[attention_mask_of_wm_generation == False] = IGNORE_INDEX
-                # wm_label[:, :int(wm_label.shape[-1]*0.1)] = IGNORE_INDEX
-                wm_label[:, :input_length] = IGNORE_INDEX
-                wm_label = wm_label.flatten()
-                discriminator_label = torch.cat((base_label, wm_label))
+            base_label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/5
+            base_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
+            # base_label[:, :int(base_label.shape[-1]*0.1)] = IGNORE_INDEX
+            base_label[:, :input_length] = IGNORE_INDEX
+            base_label = base_label.flatten()
+            wm_label = torch.zeros_like(wm_generation) + torch.rand(wm_generation.shape, device=wm_generation.device)/5
+            wm_label[attention_mask_of_wm_generation == False] = IGNORE_INDEX
+            # wm_label[:, :int(wm_label.shape[-1]*0.1)] = IGNORE_INDEX
+            wm_label[:, :input_length] = IGNORE_INDEX
+            wm_label = wm_label.flatten()
+            discriminator_label = torch.cat((base_label, wm_label))
 
-                watermark_prob = all_generation_outputs.watermark_prob.flatten()
+            watermark_prob = all_generation_outputs.watermark_prob.flatten()
 
-                watermark_prob = watermark_prob[discriminator_label != IGNORE_INDEX]
-                discriminator_label = discriminator_label[discriminator_label != IGNORE_INDEX]
+            watermark_prob = watermark_prob[discriminator_label != IGNORE_INDEX]
+            discriminator_label = discriminator_label[discriminator_label != IGNORE_INDEX]
 
-                discriminator_loss = discriminator_loss_func(watermark_prob, discriminator_label.float())
+            discriminator_loss = discriminator_loss_func(watermark_prob, discriminator_label.float())
 
-                discriminator_acc = self.get_acc(watermark_prob.detach().clone(), discriminator_label.detach().clone())
+            pred = watermark_prob.detach().clone()
+            pred[pred >= 0] = 1
+            pred[pred < 0] = 0
 
-                self.acc_queue[self.queue_idx] = discriminator_acc
-                self.queue_idx = (self.queue_idx + 1)%self.queue_len
-            # end
+            discriminator_acc = self.get_acc(pred, discriminator_label.detach().clone())
 
-        if self.generator_stage and self.discriminator_stage:
-            loss = self.loss_alpha*generator_loss + (1 - self.loss_alpha)*discriminator_loss
-        elif self.generator_stage:
+            self.acc_queue[self.queue_idx] = discriminator_acc
+            self.queue_idx = (self.queue_idx + 1)%self.queue_len
+
+        if self.generator_stage:
             loss = generator_loss
         elif self.discriminator_stage:
             loss = discriminator_loss
@@ -402,6 +435,8 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
 
         return WatermarkCausalLMOutputWithPast(
             loss=loss,
+            gen_dis_pred=gen_dis_pred,
+            discriminator_pred=pred,
             base_model_generation=base_model_generation,
             watermarked_generation=watermarked_generation,
             logs=logs,
