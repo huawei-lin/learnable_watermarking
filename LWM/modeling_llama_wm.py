@@ -15,6 +15,8 @@ from transformers.models.llama.modeling_llama import (
     LlamaRMSNorm
 )
 from peft.peft_model import PeftModel
+from peft.utils.other import _get_submodules
+from peft.tuners.tuners_utils import BaseTunerLayer
 from contextlib import contextmanager, nullcontext
 from .patching import llama_model_forward
 import copy
@@ -60,21 +62,21 @@ class WatermarkConfig():
 class Discriminator(nn.Module):
     def __init__(self, config):
         super().__init__()
-        '''
-        Name the discriminator layer with 'lora_' to pretend to be a lora adapter
-        Peft lora will set all the module which name with 'lora_' to trainable
-        https://github.com/huggingface/peft/blob/5a4b9cade64bac8afdff5006ee9dd815c90b5469/src/peft/tuners/lora/model.py#L253
-        '''
-        self.layers_num = 6
 
-        self.decoder_layer_list = nn.ModuleList([LlamaDecoderLayer(config, config.num_hidden_layers + i) for i in range(self.layers_num)])
+        self.layers_num = 3
+        hidden_size_list = [1024, 128, 1]
 
+
+        self.decoder_layer_list = nn.ModuleList([
+            LlamaDecoderLayer(config, config.num_hidden_layers + i) for i in range(self.layers_num)
+        ])
+
+        hidden_size_list = [config.hidden_size, *hidden_size_list]
         self.mlp_layer_list = nn.ModuleList()
-        self.mlp_layer_list.append(nn.Linear(4096, 512))
-        self.mlp_layer_list.append(nn.SiLU())
-        self.mlp_layer_list.append(nn.Linear(512, 32))
-        self.mlp_layer_list.append(nn.SiLU())
-        self.mlp_layer_list.append(nn.Linear(32, 1))
+        for i in range(len(hidden_size_list) - 1):
+            self.mlp_layer_list.append(nn.Linear(hidden_size_list[i], hidden_size_list[i + 1]))
+            if hidden_size_list[i + 1] != 1:
+                self.mlp_layer_list.append(nn.SiLU())
 
     def forward(
         self,
@@ -117,13 +119,24 @@ class WatermarkedLlama(nn.Module):
 
         # Copy the last decoder layer to discriminator
         for i in range(self.discriminator.layers_num):
-            discriminator_layer_idx = self.discriminator.decoder_layer_list[i].self_attn.layer_idx
-            self.discriminator.decoder_layer_list[i] = copy.deepcopy(self.get_decoder().layers[i - self.discriminator.layers_num])
-            self.discriminator.decoder_layer_list[i].self_attn.layer_idx = discriminator_layer_idx
+            self.replace_transformer_weight(self.get_decoder().layers[self.discriminator.layers_num - 1], self.discriminator.decoder_layer_list[i])
 
         for i, layer in enumerate(self.get_decoder().layers):
             layer.register_forward_hook(get_transformers_ouput(i))
         self.get_decoder().layers[0].register_forward_pre_hook(get_transformers_input(0), with_kwargs=True)
+
+    def replace_transformer_weight(self, source_module, target_module):
+        layer_idx = source_module.self_attn.layer_idx
+        target_module.self_attn.layer_idx = layer_idx
+        key_list = [key for key, _ in target_module.named_modules()]
+        for key in key_list:
+            if "." not in key or "rotary_emb" in key or "act_fn" in key:
+                continue
+            _, source_layer, _ = _get_submodules(source_module, key)
+            _, target_layer, _ = _get_submodules(target_module, key)
+            if isinstance(source_layer, BaseTunerLayer):
+                source_layer = source_layer.base_layer
+            target_layer.weight = nn.Parameter(source_layer.weight.detach().clone())
 
     def __getattr__(self, name: str):
         """Forward missing attributes to the wrapped module."""
@@ -212,6 +225,9 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
 
     @contextmanager
     def mark_adapters_as_untrainable(self):
+        name2trainable = {}
+        for n, p in self.model.named_parameters():
+            name2trainable[n] = p.requires_grad
         try:
             for n, p in self.model.named_parameters():
                 if "lora_" in n and "discriminator" not in n:
@@ -219,11 +235,13 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             yield
         finally:
             for n, p in self.model.named_parameters():
-                if "lora_" in n:
-                    p.requires_grad = True
+                p.requires_grad = name2trainable[n]
 
     @contextmanager
     def mark_discriminator_as_untrainable(self):
+        name2trainable = {}
+        for n, p in self.model.named_parameters():
+            name2trainable[n] = p.requires_grad
         try:
             for n, p in self.model.named_parameters():
                 if "discriminator" in n:
@@ -231,8 +249,7 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             yield
         finally:
             for n, p in self.model.named_parameters():
-                if "discriminator" in n:
-                    p.requires_grad = True
+                p.requires_grad = name2trainable[n]
 
     def get_stage(self):
         '''
@@ -250,7 +267,6 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
 
             self.total_cnt += 1
             self.first_loop = False
-
 
     def get_acc(self, pred, label):
         if pred is None or label is None:
@@ -351,7 +367,6 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             generation_loss = loss_fct(shift_logits, shift_labels)
 
             generator_loss = self.loss_alpha*generation_loss + (1 - self.loss_alpha)*gen_discriminator_loss
-
 
         wm_generation = self.model.generate(
             input_ids,

@@ -34,8 +34,11 @@ class WatermarkTrainer(Trainer):
 
     def log(self, logs: Dict[str, float]) -> None:
         def get_item(x):
-            return x.item() if x is not None else 0
-
+            if x is None:
+                return 0
+            if torch.is_tensor(x):
+                return x.item()
+            return x
 
         if self.is_world_process_zero():
             text_table = wandb.Table(columns=[
