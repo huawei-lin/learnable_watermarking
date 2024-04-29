@@ -24,6 +24,7 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
 
+
 @dataclass
 class AdapterArguments:
     load_in_4bit: Optional[bool] = field(default=False)
@@ -37,16 +38,5 @@ class AdapterArguments:
 
 def get_args():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments, AdapterArguments))
-    model_args, data_args, training_args, other_args = parser.parse_args_into_dataclasses()
-    # model_args, data_args, training_args, other_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
-
-#     other_parser = argparse.ArgumentParser()
-#     other_parser.add_argument('--load_in_4bit', type=lambda x:bool(distutils.util.strtobool(x)), default=False)
-#     other_parser.add_argument('--load_in_8bit', type=lambda x:bool(distutils.util.strtobool(x)), default=False)
-#     other_parser.add_argument('--use_lora', type=lambda x:bool(distutils.util.strtobool(x)), default=False)
-#     other_parser.add_argument('--lora_r', type=int, default=8)
-#     other_parser.add_argument('--lora_alpha', type=int, default=16)
-#     other_parser.add_argument('--lora_target_modules', nargs="+", default=['q_proj, v_proj'])
-#     other_parser.add_argument('--loss_alpha', type=float, default=0.5)
-#     other_args = other_parser.parse_args(other_args)
-    return model_args, data_args, training_args, other_args
+    model_args, data_args, training_args, adapter_args = parser.parse_args_into_dataclasses()
+    return model_args, data_args, training_args, adapter_args

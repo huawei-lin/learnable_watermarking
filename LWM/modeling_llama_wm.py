@@ -44,7 +44,7 @@ class WatermarkCausalLMOutputWithPast(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     gen_dis_pred: Optional[torch.FloatTensor] = None
     watermark_prob: Optional[torch.FloatTensor] = None
-    discriminator_pred: Optional[torch.FloatTensor] = None
+    discriminator_pred: Optional[torch.FloatTensor] = None # binarize watermark_prob
     logits: Optional[torch.FloatTensor] = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
@@ -222,6 +222,12 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             return super().__getattr__(name)  # defer to nn.Module's logic
         except AttributeError:
             return getattr(self.model, name)
+
+    def generate(self, *args, **kwargs):
+        return self.model.generate(*args, **kwargs)
+
+#     def __call__(self, *args, **kwargs):
+#         return self.model.__call__(*args, **kwargs)
 
     @contextmanager
     def mark_adapters_as_untrainable(self):
