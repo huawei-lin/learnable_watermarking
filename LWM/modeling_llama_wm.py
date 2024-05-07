@@ -22,6 +22,7 @@ from .patching import llama_model_forward
 import copy
 
 IGNORE_INDEX = -100
+model_max_length = 1024
 
 
 transformers_output = {}
@@ -200,6 +201,7 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
     def __init__(self, model, tokenizer, loss_alpha=0.5):
         nn.Module.__init__(self)
         self.loss_alpha = loss_alpha
+        self.loss_alpha_diff = loss_alpha
         self.model = model
         self.tokenizer = tokenizer
 
@@ -211,8 +213,9 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         self.first_loop = True
 
         self.total_cnt = 0
+        self.stage_cnt = 0
 
-        self.queue_len = 8
+        self.queue_len = 16
         self.queue_idx = 0
         self.acc_queue = torch.zeros((self.queue_len))
 
@@ -263,16 +266,25 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         2. Train discriminator and generator for num times
         '''
 
-        if self.discriminator_stage == True and self.acc_queue.mean() > 0.85:
+        self.acc_queue_mean = self.acc_queue.mean()
+
+        if self.discriminator_stage == True and self.acc_queue_mean > 0.9:
             self.discriminator_stage = False
             self.generator_stage = True
+            self.stage_cnt = 0
 
-        if self.generator_stage == True and self.acc_queue.mean() < 0.5:
+        elif self.generator_stage == True and (self.acc_queue_mean > 0.9 or self.acc_queue_mean < 0.75):
             self.discriminator_stage = True
             self.generator_stage = False
 
             self.total_cnt += 1
+            self.stage_cnt = 0
             self.first_loop = False
+
+        self.stage_cnt += 1
+        if self.generator_stage == True:
+            self.loss_alpha_diff = self.loss_alpha_diff*0.99
+            self.loss_alpha = 1 - self.loss_alpha_diff
 
     def get_acc(self, pred, label):
         if pred is None or label is None:
@@ -307,7 +319,7 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         with self.model.disable_adapter():
             base_generation = self.model.generate(
                 input_ids,
-                max_length=512,
+                max_length=model_max_length,
                 attention_mask=attention_mask,
                 num_beams=5,
                 no_repeat_ngram_size=4,
@@ -315,9 +327,10 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
                 do_sample = True,
                 top_p = 0.8,
                 pad_token_id=self.tokenizer.pad_token_id,
-                early_stopping=True,
+                # early_stopping=True,
             )
             base_model_generation = self.tokenizer.batch_decode(base_generation, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            base_generation_len = base_generation.shape[-1]
 
         attention_mask_for_wm_training = base_generation.ne(self.tokenizer.pad_token_id)
 
@@ -338,7 +351,7 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
                 return_dict=return_dict,
                 **kwargs,
             )
-            discriminator_label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/5
+            discriminator_label = torch.zeros_like(base_generation) + torch.rand(base_generation.shape, device=base_generation.device)/10
             # discriminator_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
             # discriminator_label[:, :int(discriminator_label.shape[-1]*0.1)] = IGNORE_INDEX
             discriminator_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
@@ -355,6 +368,7 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             gen_dis_pred[gen_dis_pred < 0] = 0
 
             gen_discriminator_loss = discriminator_loss_func(watermark_prob, discriminator_label.float())
+            gen_discriminator_acc = self.get_acc(gen_dis_pred, discriminator_label.detach().clone())
 
             logits = outputs.logits
 
@@ -372,11 +386,12 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             shift_labels = shift_labels.to(shift_logits.device)
             generation_loss = loss_fct(shift_logits, shift_labels)
 
-            generator_loss = self.loss_alpha*generation_loss + (1 - self.loss_alpha)*gen_discriminator_loss
+            # generator_loss = self.loss_alpha*generation_loss + (1 - self.loss_alpha)*gen_discriminator_loss
+            generator_loss = generation_loss
 
         wm_generation = self.model.generate(
             input_ids,
-            max_length=512,
+            max_length=model_max_length,
             attention_mask=attention_mask,
             num_beams=5,
             no_repeat_ngram_size=4,
@@ -384,12 +399,14 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             do_sample = True,
             top_p = 0.8,
             pad_token_id=self.tokenizer.pad_token_id,
-            early_stopping=True,
+            # early_stopping=True,
         )
         watermarked_generation = self.tokenizer.batch_decode(wm_generation[:1,:], skip_special_tokens=True, clean_up_tokenization_spaces=False)
         attention_mask_of_wm_generation=wm_generation.ne(self.tokenizer.pad_token_id)
+        wm_generation_len = wm_generation.shape[-1]
 
-        with self.mark_adapters_as_untrainable() if self.discriminator_stage else torch.no_grad():
+        # with self.mark_adapters_as_untrainable() if self.discriminator_stage else torch.no_grad():
+        with self.mark_adapters_as_untrainable() if self.discriminator_stage else nullcontext():
             diff = base_generation.shape[-1] - wm_generation.shape[-1]
 
             base_generation = F.pad(base_generation, (0, -diff if diff < 0 else 0, 0, 0), value=self.tokenizer.pad_token_id)
@@ -405,12 +422,12 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
                 attention_mask=all_attn_mask,
             )
 
-            base_label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/5
+            base_label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/10
             base_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
             # base_label[:, :int(base_label.shape[-1]*0.1)] = IGNORE_INDEX
             base_label[:, :input_length] = IGNORE_INDEX
             base_label = base_label.flatten()
-            wm_label = torch.zeros_like(wm_generation) + torch.rand(wm_generation.shape, device=wm_generation.device)/5
+            wm_label = torch.zeros_like(wm_generation) + torch.rand(wm_generation.shape, device=wm_generation.device)/10
             wm_label[attention_mask_of_wm_generation == False] = IGNORE_INDEX
             # wm_label[:, :int(wm_label.shape[-1]*0.1)] = IGNORE_INDEX
             wm_label[:, :input_length] = IGNORE_INDEX
@@ -434,7 +451,8 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             self.queue_idx = (self.queue_idx + 1)%self.queue_len
 
         if self.generator_stage:
-            loss = generator_loss
+            # loss = generator_loss 
+            loss = self.loss_alpha*generator_loss + (1 - self.loss_alpha)*discriminator_loss
         elif self.discriminator_stage:
             loss = discriminator_loss
         else:
@@ -446,13 +464,16 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         logs = {
             "generator_loss": generator_loss.item(),
             "generation_loss": generation_loss.item(),
+            "base_generation_len": base_generation_len,
+            "watermarked_generation_len": wm_generation_len,
             "gen_discriminator_loss": gen_discriminator_loss.item(),
             "discriminator_loss": discriminator_loss.item(),
             "discriminator_acc": discriminator_acc.item(),
+            "gen_discriminator_acc": gen_discriminator_acc.item(),
             "loss_alpha": self.loss_alpha,
             "stage": -1*int(self.discriminator_stage) + int(self.generator_stage),
+            "acc_queue_mean": self.acc_queue_mean.item(),
         }
-
 
         return WatermarkCausalLMOutputWithPast(
             loss=loss,

@@ -186,26 +186,28 @@ def get_model_tokenizer(training_args, model_args, other_args):
         checkpoint_name = os.path.join(
             training_args.resume_from_checkpoint, "pytorch_model.bin"
         )  # Full checkpoint
-        if not os.path.exists(checkpoint_name):
-            adapter_checkpoint_name = os.path.join(
-                training_args.resume_from_checkpoint, "adapter_model.bin"
-            )  # only LoRA model - LoRA config above has to fit
-            discriminator_checkpoint_name = os.path.join(
-                training_args.resume_from_checkpoint, "discriminator.bin"
-            ) 
-            training_args.resume_from_checkpoint = (
-                False  # So the trainer won't try loading its state
-            )
-        # The two files above have a different name depending on how they were saved, but are actually the same.
-        if os.path.exists(adapter_checkpoint_name):
-            print(f"Restarting from {adapter_checkpoint_name}")
-            adapters_weights = torch.load(adapter_checkpoint_name)
+    else:
+        training_args.resume_from_checkpoint = (
+            False  # So the trainer won't try loading its state
+        )
+
+    if training_args.adapters_resume_from_checkpoint:
+        adapters_checkpoint_name = os.path.join(
+            training_args.adapters_resume_from_checkpoint, "adapter_model.bin"
+        )
+        if os.path.exists(adapters_checkpoint_name):
+            print(f"Restarting adapters from {adapters_checkpoint_name}")
+            adapters_weights = torch.load(adapters_checkpoint_name)
             set_peft_model_state_dict(model.model.peft_model, adapters_weights)
         else:
-            print(f"Adapter checkpoint {adapter_checkpoint_name} not found")
+            print(f"Adapter checkpoint {adapters_checkpoint_name} not found")
 
+    if training_args.discriminator_resume_from_checkpoint:
+        discriminator_checkpoint_name = os.path.join(
+            training_args.discriminator_resume_from_checkpoint, "discriminator.bin"
+        )
         if os.path.exists(discriminator_checkpoint_name):
-            print(f"Restarting from {discriminator_checkpoint_name}")
+            print(f"Restarting discriminator from {discriminator_checkpoint_name}")
             discriminator_weights = torch.load(discriminator_checkpoint_name)
             model.model.discriminator.load_state_dict(discriminator_weights)
         else:
