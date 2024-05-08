@@ -43,16 +43,22 @@ class WatermarkTrainer(Trainer):
         if self.is_world_process_zero():
             text_table = wandb.Table(columns=[
                 "base_model_generation",
-                "gen_dis_pred",
+                "base_generation_pred",
                 "watermarked_generation",
-                "discriminator_pred",
+                "watermarked_generation_pred",
             ])
+            batch_size = len(self.outputs.pred_index_offset)//2
+            pred_index_offset = np.cumsum([0] + self.outputs.pred_index_offset)
             with np.printoptions(threshold=np.inf):
-                text_table.add_data(self.outputs.base_model_generation[0], str(self.outputs.gen_dis_pred.detach().cpu().numpy()), self.outputs.watermarked_generation[0], str(self.outputs.discriminator_pred.detach().cpu().numpy()))
-#             for idx, (base_model_generation, watermarked_generation) \
-#                 in enumerate(zip(self.outputs.base_model_generation, self.outputs.watermarked_generation)):
-#         
-#                 text_table.add_data(base_model_generation, watermarked_generation)
+                discriminator_pred = self.outputs.discriminator_pred.detach().cpu().numpy()
+                for idx, (base_model_generation, watermarked_generation) \
+                    in enumerate(zip(self.outputs.base_model_generation, self.outputs.watermarked_generation)):
+                    text_table.add_data(
+                        base_model_generation,
+                        str(discriminator_pred[pred_index_offset[idx]:pred_index_offset[idx + 1]]),
+                        watermarked_generation,
+                        str(discriminator_pred[pred_index_offset[batch_size + idx]:pred_index_offset[batch_size + idx + 1]]),
+                    )
     
             for callback in self.callback_handler.callbacks:
                 if isinstance(callback, WandbCallback):

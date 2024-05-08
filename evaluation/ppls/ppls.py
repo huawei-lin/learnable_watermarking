@@ -102,10 +102,9 @@ for i, prompt in enumerate(dataset['text']):
                 truncation=True,
             ).input_ids
 
-    prompt = prompt.split(".")[0]
+    prompt = " ".join(prompt.split(" ")[:10])
 
     total_result["prompt"] = prompt
-
 
     tokenized = tokenizer(
                 prompt,
@@ -127,7 +126,6 @@ for i, prompt in enumerate(dataset['text']):
     ).input_ids.cuda()
     openai_output = model.model(openai_ids)
     prob = F.sigmoid(openai_output.watermark_prob).detach().cpu().numpy().reshape((-1))
-    # openai_prob = prob[input_ids.shape[-1]:].mean()
     openai_prob = weighted_arithmetic_mean(prob[input_ids.shape[-1]:])
     openai_ppls = perplexity(openai_generation)['ppls']
 
@@ -150,7 +148,6 @@ for i, prompt in enumerate(dataset['text']):
 
     base_output = model.model(base_generation)
     prob = F.sigmoid(base_output.watermark_prob).detach().cpu().numpy().reshape((-1))
-    # base_prob = prob[input_ids.shape[-1]:].mean()
     base_prob = weighted_arithmetic_mean(prob[input_ids.shape[-1]:])
     base_ppls = perplexity(base_model_generation)['ppls']
     base_result = {
@@ -171,7 +168,6 @@ for i, prompt in enumerate(dataset['text']):
     
     watermarked_output = model.model(watermarked_generation)
     prob = F.sigmoid(watermarked_output.watermark_prob).detach().cpu().numpy().reshape((-1))
-    # watermarked_prob = prob[input_ids.shape[-1]:].mean()
     watermarked_prob = weighted_arithmetic_mean(prob[input_ids.shape[-1]:])
     watermarked_ppls = perplexity(watermarked_model_generation)['ppls']
     watermarked_result = {
@@ -192,7 +188,6 @@ for i, prompt in enumerate(dataset['text']):
     ).input_ids.cuda()
     openai_attack_output = model.model(openai_attack_ids)
     prob = F.sigmoid(openai_attack_output.watermark_prob).detach().cpu().numpy().reshape((-1))
-    # openai_attack_prob = prob[input_ids.shape[-1]:].mean()
     openai_attack_prob = weighted_arithmetic_mean(prob[input_ids.shape[-1]:])
     openai_attack_ppls = perplexity(openai_attack_generation)['ppls']
 
