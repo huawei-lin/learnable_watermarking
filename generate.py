@@ -14,16 +14,20 @@ from LWM.utils import (
     AdapterArguments
 )
 
-prompt = "America is the"
-prompt = "China is"
-prompt = "China is a major economic powerhouse for the world economy."
+# prompt = "Question: Where is Singapore? Answer:"
+# prompt = "America is the"
+# prompt = "China is"
+# prompt = "China is a major economic powerhouse for the world economy."
 # prompt = "In modern neuroscience, observing the dynamics of large populations of neurons is a critical step of understanding how networks of neurons process information. Light-field microscopy (LFM) has emerged as a type of scanless, high-speed, three-dimensional (3D) imaging tool, particularly attractive for this purpose."
 # prompt = "In modern neuroscience, observing the dynamics of large populations of neurons is a critical step of understanding how networks of neurons process information."
+# prompt = "Recently, Large language models (LLMs) have"
+
 
 base_model_path = "meta-llama/Llama-2-7b-hf"
-checkpoints_path = "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/3L_dense_alpha0.1_ne5_llama2_7b_qv_r64_a128_lr1e-4_bs0/checkpoint-60/"
-checkpoints_path = "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/3L_dense_alpha0.1_ne5_llama2_7b_qv_r64_a128_lr1e-4_bs0/checkpoint-300/"
-checkpoints_path = "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/3L_dense_alpha0.1_ne1_llama2_7b_qv_r8_a16_lr1e-4_bs0/checkpoint-480"
+base_model_path = "meta-llama/Meta-Llama-3-8B"
+
+checkpoints_path = "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/stage_limit_decay0.99_wiki_t16_3L_dense_alpha0.5_ne1_llama3_8b_qv_r8_a16_lr1e-4_bs0/checkpoint-1440"
+
 
 lora_r  = 8
 lora_alpha = lora_r*2
@@ -32,7 +36,8 @@ model_args = ModelArguments
 model_args.model_name_or_path = base_model_path
 
 training_args= TrainingArguments
-training_args.resume_from_checkpoint = checkpoints_path
+training_args.discriminator_resume_from_checkpoint = checkpoints_path
+training_args.adapters_resume_from_checkpoint = checkpoints_path
 
 adapter_args = AdapterArguments
 adapter_args.lora_r = lora_r
@@ -52,6 +57,7 @@ tokenized = tokenizer(
             truncation=True,
         )
 input_ids = tokenized.input_ids.cuda()
+# input_ids = input_ids[0].repeat(4, 1)
 print("input_ids:", input_ids)
 
 

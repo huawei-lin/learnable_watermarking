@@ -43,9 +43,7 @@ base_model_path = "meta-llama/Meta-Llama-3-8B"
 evaluate_model = "google/gemma-7b"
 perplexity = Perplexity(evaluate_model)
 
-checkpoints_path = "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/stage_limit_decay0.99_wiki_t16_3L_dense_alpha0.5_ne1_llama3_8b_qv_r8_a16_lr1e-4_bs0/checkpoint-1440"
-checkpoints_path = "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/c60_75T90_decay0.99_wiki_t16_3L_dense_alpha0.5_ne1_llama3_8b_qv_r8_a16_lr1e-4_bs0/checkpoint-750"
-# checkpoints_path = "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/0.1_stage_limit_decay0.99_wiki_t16_3L_dense_alpha0.5_ne1_llama3_8b_qv_r8_a16_lr1e-4_bs0/checkpoint-390"
+checkpoints_path = "/home/hl3352/LLMs/LearnableWatermarking/learnable_watermarking/exp_wikitext/alpha0.5_ne1_llama3_8b_qv_r8_a16_lr1e-4_bs4/checkpoint-1710"
 
 openai_attack_prompt = "As an expert copy-editor, please rewrite the following text in your own voice while ensuring that the final output contains the same information as the original text and has roughly the same length. Please paraphrase all sentences and do not omit any crucial details. Additionally, please take care to provide any relevant information about public figures, organizations, or other entities mentioned in the text to avoid any potential misunderstandings or biases."
 # openai_attack_prompt = "paraphrase the following paragraphs:\n"
@@ -81,7 +79,7 @@ with open(result_path, "w") as fw:
     pass
 
 generate_args = {
-    "num_beams": 5,
+    "num_beams": 4,
     "no_repeat_ngram_size": 4,
     "num_return_sequences": 1,
     "do_sample":  True,

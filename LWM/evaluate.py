@@ -1,7 +1,9 @@
+import time
 import numpy as np
 import torch
 from torch.nn import CrossEntropyLoss
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from collections import defaultdict
 
 
 class Perplexity:
@@ -95,3 +97,28 @@ class Perplexity:
             return {"ppls": ppls[0]}
         return {"ppls": ppls, "mean_ppls": np.mean(ppls)}
 
+
+class Timer:
+    def __init__(self):
+        self.time = time.time()
+        self.record = defaultdict(lambda: 0)
+
+    def start(self):
+        self.time = time.time()
+
+    def restart(self):
+        self.start()
+
+    def get_time(self, name=None):
+        lapse = time.time() - self.time
+        if name is not None:
+            self.record[name] += lapse
+        return lapse
+
+    def get_time_and_restart(self, name=None):
+        lapse = self.get_time(name)
+        self.restart()
+        return lapse
+
+    def get_record(self):
+        return self.record

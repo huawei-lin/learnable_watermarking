@@ -1,5 +1,8 @@
 import os
+import time
+import math
 import transformers
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,14 +21,12 @@ from peft.peft_model import PeftModel
 from peft.utils.other import _get_submodules
 from peft.tuners.tuners_utils import BaseTunerLayer
 from contextlib import contextmanager, nullcontext
-from .patching import llama_model_forward
-import copy
+from .evaluate import Timer
+from copy import copy
 
 IGNORE_INDEX = -100
-model_max_length = 768
 
 generate_kwargs = {
-    "max_length": model_max_length,
     "num_beams": 4,
     "no_repeat_ngram_size": 4,
     "num_return_sequences": 1,
@@ -37,14 +38,12 @@ generate_kwargs = {
 
 transformers_output = {}
 def get_transformers_ouput(i):
-    # the hook signature
     def hook(model, input, output):
         transformers_output[i] = output[0]
     return hook
 
 transformers_input_kwargs = {}
 def get_transformers_input(i):
-    # the hook signature
     def hook(model, input, kwargs):
         transformers_input_kwargs[i] = kwargs
     return hook
@@ -126,9 +125,10 @@ class WatermarkedLlama(nn.Module):
         self.peft_model = peft_model
 
         ###########
-        for name, module in self.peft_model.named_modules():
-            if 'lora_A.default' in name or 'lora_B.default' in name:
-                nn.init.normal_(module.weight, std=3e-2)
+#         for name, module in self.peft_model.named_modules():
+#             if 'lora_A.default' in name or 'lora_B.default' in name:
+#                 # nn.init.normal_(module.weight, std=1/min(module.weight.shape))
+#                 nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
         ###########
 
         self.disc_layernorm = LlamaRMSNorm(peft_model.config.hidden_size, eps=peft_model.config.rms_norm_eps)
@@ -198,7 +198,6 @@ class WatermarkedLlama(nn.Module):
         transformers_output_sum = torch.stack(tuple(transformers_output.values())).sum(axis=0)
 
         watermark_prob = self.discriminator(
-            # hidden_states.clone(),
             self.disc_layernorm(transformers_output_sum),
             **transformers_input_kwargs[0],
         )
@@ -233,6 +232,8 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         self.queue_len = 16
         self.queue_idx = 0
         self.acc_queue = torch.zeros((self.queue_len))
+
+        self.timer = Timer()
 
     def __getattr__(self, name: str):
         """Forward missing attributes to the wrapped module."""
@@ -276,19 +277,15 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
                 p.requires_grad = name2trainable[n]
 
     def get_stage(self):
-        '''
-        1. Train discriminator for num times
-        2. Train discriminator and generator for num times
-        '''
-
         self.acc_queue_mean = self.acc_queue.mean()
 
-        if self.discriminator_stage == True and self.acc_queue_mean > 0.9:
+        if self.discriminator_stage == True and self.acc_queue_mean > 0.85:
             self.discriminator_stage = False
             self.generator_stage = True
             self.stage_cnt = 0
 
-        elif self.generator_stage == True and (self.acc_queue_mean > 0.9 or self.acc_queue_mean < 0.75):
+        elif self.generator_stage == True and (self.acc_queue_mean > 0.85 or self.acc_queue_mean < 0.75):
+        # elif self.generator_stage == True and self.acc_queue_mean < 0.75:
             self.discriminator_stage = True
             self.generator_stage = False
 
@@ -298,7 +295,7 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
 
         self.stage_cnt += 1
         if self.generator_stage == True:
-            self.loss_alpha_diff = self.loss_alpha_diff*0.99
+            self.loss_alpha_diff = self.loss_alpha_diff*0.995
             self.loss_alpha = 1 - self.loss_alpha_diff
 
     def get_acc(self, pred, label):
@@ -308,6 +305,11 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         label[label < 0.5] = 0
         return torch.sum(pred == label)/len(pred)
 
+    def get_generate_kwargs(self):
+        kwargs = copy(generate_kwargs)
+        kwargs["num_beams"] = random.randint(1, 5)
+        kwargs["no_repeat_ngram_size"] = random.randint(1, 5)
+        return kwargs
 
     def forward(
         self,
@@ -323,28 +325,37 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
         return_dict: Optional[bool] = None,
         **kwargs,
     ):
-        self.get_stage()
+        self.timer.start()
+
         generator_loss = None
         discriminator_loss = None
         discriminator_loss_func = BCEWithLogitsLoss()
 
         batch_size, input_length = input_ids.shape
+        self.get_stage()
+
+        self.timer.get_time_and_restart("get_stage")
 
         with self.model.disable_adapter():
             base_generation = self.model.generate(
                 input_ids,
                 attention_mask=attention_mask,
                 pad_token_id=self.tokenizer.pad_token_id,
-                **generate_kwargs,
+                max_length=self.tokenizer.model_max_length,
+                **self.get_generate_kwargs(),
             )
             base_model_generation = self.tokenizer.batch_decode(base_generation, skip_special_tokens=True, clean_up_tokenization_spaces=False)
             base_generation_len = base_generation.shape[-1]
+
+        self.timer.get_time_and_restart("get_base_model_generation")
 
         attention_mask_for_wm_training = base_generation.ne(self.tokenizer.pad_token_id)
 
         labels = base_generation.detach().clone()
         labels[:, :input_ids.shape[-1]] = IGNORE_INDEX
         labels[base_generation == self.tokenizer.pad_token_id] = IGNORE_INDEX
+
+        self.timer.get_time_and_restart("construct_label_for_base_generation")
 
         with self.mark_discriminator_as_untrainable() if self.generator_stage else torch.no_grad():
             outputs = self.model(
@@ -359,6 +370,7 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
                 return_dict=return_dict,
                 **kwargs,
             )
+            self.timer.get_time_and_restart("generator forwarding")
             discriminator_label = torch.ones_like(base_generation) - torch.rand(base_generation.shape, device=base_generation.device)/10
             # discriminator_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
             # discriminator_label[:, :int(discriminator_label.shape[-1]*0.1)] = IGNORE_INDEX
@@ -394,21 +406,25 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             shift_labels = shift_labels.to(shift_logits.device)
             generation_loss = loss_fct(shift_logits, shift_labels)
 
-            # generator_loss = self.loss_alpha*generation_loss + (1 - self.loss_alpha)*gen_discriminator_loss
             generator_loss = generation_loss
+
+        self.timer.get_time_and_restart("generator loss calculating")
 
         wm_generation = self.model.generate(
             input_ids,
             attention_mask=attention_mask,
             pad_token_id=self.tokenizer.pad_token_id,
-            **generate_kwargs,
+            max_length=self.tokenizer.model_max_length,
+            **self.get_generate_kwargs(),
         )
         watermarked_generation = self.tokenizer.batch_decode(wm_generation, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         attention_mask_of_wm_generation=wm_generation.ne(self.tokenizer.pad_token_id)
         wm_generation_len = wm_generation.shape[-1]
+        self.timer.get_time_and_restart("watermarked_generation")
 
         pred_index_offset = [(x[input_length:] == True).sum().item() for atten_masks in (attention_mask_for_wm_training, attention_mask_of_wm_generation) for x in atten_masks]
 
+        self.timer.get_time_and_restart("get pred_index_offset")
         # with self.mark_adapters_as_untrainable() if self.discriminator_stage else torch.no_grad():
         with self.mark_adapters_as_untrainable() if self.discriminator_stage else nullcontext():
             diff = base_generation.shape[-1] - wm_generation.shape[-1]
@@ -422,10 +438,14 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             all_generation = torch.cat((base_generation, wm_generation))
             all_attn_mask = torch.cat((attention_mask_for_wm_training, attention_mask_of_wm_generation))
 
+            self.timer.get_time_and_restart("construct mask")
+
             all_generation_outputs = self.model(
                 input_ids=all_generation,
                 attention_mask=all_attn_mask,
             )
+
+            self.timer.get_time_and_restart("discriminator forwarding")
 
             base_label = torch.zeros_like(base_generation) + torch.rand(base_generation.shape, device=base_generation.device)/10
             base_label[attention_mask_for_wm_training == False] = IGNORE_INDEX
@@ -455,8 +475,9 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             self.acc_queue[self.queue_idx] = discriminator_acc
             self.queue_idx = (self.queue_idx + 1)%self.queue_len
 
+            self.timer.get_time_and_restart("discriminator loss calculating")
+
         if self.generator_stage:
-            # loss = generator_loss 
             loss = self.loss_alpha*generator_loss + (1 - self.loss_alpha)*discriminator_loss
         elif self.discriminator_stage:
             loss = discriminator_loss
@@ -479,6 +500,10 @@ class AllInOneModel(LlamaForCausalLM, nn.Module):
             "stage": -1*int(self.discriminator_stage) + int(self.generator_stage),
             "acc_queue_mean": self.acc_queue_mean.item(),
         }
+
+        self.timer.get_time_and_restart("finalizing")
+
+        print(self.timer.get_record())
 
         return WatermarkCausalLMOutputWithPast(
             loss=loss,
